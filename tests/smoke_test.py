@@ -69,6 +69,45 @@ async def run() -> None:
         row, col = ed.cursor_location
         assert ed.document.get_line(row)[col : col + 5] == "world"
 
+        # Visual line mode: V selects the whole line, j extends, y yanks linewise
+        await pilot.press("g", "g", "j")  # on "Y# Title"
+        await pilot.press("V")
+        assert ed.mode == "visual_line"
+        start, end = sorted([ed.selection.start, ed.selection.end])
+        assert start == (1, 0) and end == (1, len("Y# Title")), ed.selection
+        await pilot.press("j")
+        start, end = sorted([ed.selection.start, ed.selection.end])
+        assert start[0] == 1 and end[0] == 2, ed.selection
+        await pilot.press("y")
+        assert ed.mode == "normal"
+        assert ed._register == ("Y# Title\nXY# Title\n", True), ed._register
+
+        # V + p: paste the two yanked lines below
+        lines_before = ed.document.line_count
+        await pilot.press("p")
+        assert ed.document.line_count == lines_before + 2
+
+        # V + d removes exactly the selected lines
+        await pilot.press("g", "g", "V", "j", "d")
+        assert ed.mode == "normal"
+        assert ed.document.line_count == lines_before
+        assert ed._register[1] is True  # linewise register
+
+        # V then k extends upward; escape collapses back to normal
+        await pilot.press("j", "j", "V", "k")
+        start, end = sorted([ed.selection.start, ed.selection.end])
+        assert end[0] - start[0] == 1, ed.selection
+        await pilot.press("escape")
+        assert ed.mode == "normal"
+        assert ed.selection.start == ed.selection.end
+
+        # v <-> V switching keeps a sensible selection
+        await pilot.press("V", "v")
+        assert ed.mode == "visual"
+        await pilot.press("V")
+        assert ed.mode == "visual_line"
+        await pilot.press("escape")
+
         # :w writes the file and clears the modified flag
         await pilot.press("colon", "w", "enter")
         await pilot.pause()

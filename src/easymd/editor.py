@@ -15,6 +15,7 @@ WORD_RE = re.compile(r"\w+|[^\w\s]+")
 NORMAL = "normal"
 INSERT = "insert"
 VISUAL = "visual"
+VISUAL_LINE = "visual_line"
 
 
 class VimTextArea(TextArea):
@@ -40,6 +41,7 @@ class VimTextArea(TextArea):
         self._pending = ""  # pending operator/prefix: d, y, c or g
         self._register: tuple[str, bool] = ("", False)  # (text, linewise)
         self._search = ""
+        self._line_anchor = 0  # anchor row for visual line mode
 
     # ------------------------------------------------------------------
     # Modes
@@ -77,7 +79,7 @@ class VimTextArea(TextArea):
         char = event.character if event.is_printable else None
 
         if key == "escape":
-            if self.mode == VISUAL:
+            if self.mode in (VISUAL, VISUAL_LINE):
                 self.selection = Selection.cursor(self.cursor_location)
             self._set_mode(NORMAL)
             self._count = ""
@@ -106,9 +108,13 @@ class VimTextArea(TextArea):
             return
 
         # Visual-mode operators act on the selection.
-        if self.mode == VISUAL and char in ("d", "x", "y", "c"):
-            self._visual_operate(char)
-            return
+        if char in ("d", "x", "y", "c"):
+            if self.mode == VISUAL:
+                self._visual_operate(char)
+                return
+            if self.mode == VISUAL_LINE:
+                self._visual_line_operate(char)
+                return
 
         # Plain motions (extend the selection in visual mode).
         target = self._motion_target(char or key, n, explicit_count)
@@ -119,7 +125,25 @@ class VimTextArea(TextArea):
         self._handle_command_key(char, key, n, explicit_count)
 
     def _move(self, target: tuple[int, int]) -> None:
-        self.move_cursor(target, select=self.mode == VISUAL)
+        if self.mode == VISUAL_LINE:
+            self.move_cursor(target)
+            self._update_linewise_selection()
+        else:
+            self.move_cursor(target, select=self.mode == VISUAL)
+
+    def _update_linewise_selection(self) -> None:
+        """Expand the selection to whole lines between the anchor and the cursor."""
+        row = self.cursor_location[0]
+        anchor = self._line_anchor
+        doc = self.document
+        if row >= anchor:
+            self.selection = Selection(
+                (anchor, 0), (row, len(doc.get_line(row)))
+            )
+        else:
+            self.selection = Selection(
+                (anchor, len(doc.get_line(anchor))), (row, 0)
+            )
 
     # ------------------------------------------------------------------
     # Normal-mode commands
@@ -172,7 +196,22 @@ class VimTextArea(TextArea):
                 self.selection = Selection.cursor(self.cursor_location)
                 self._set_mode(NORMAL)
             else:
+                # From normal or visual line; keep the selection when switching.
                 self._set_mode(VISUAL)
+        elif char == "V":
+            if self.mode == VISUAL_LINE:
+                self.selection = Selection.cursor(self.cursor_location)
+                self._set_mode(NORMAL)
+            else:
+                # Anchor on the selection start when coming from charwise visual.
+                if self.mode == VISUAL:
+                    self._line_anchor = min(
+                        self.selection.start[0], self.selection.end[0]
+                    )
+                else:
+                    self._line_anchor = row
+                self._set_mode(VISUAL_LINE)
+                self._update_linewise_selection()
         elif char == "p":
             self._paste(after=True, n=n)
         elif char == "P":
@@ -334,6 +373,21 @@ class VimTextArea(TextArea):
         self.delete(start, target)
         if op == "c":
             self._set_mode(INSERT)
+
+    def _visual_line_operate(self, char: str) -> None:
+        sel = self.selection
+        row, end_row = sorted([sel.start[0], sel.end[0]])
+        self._register = (self._line_range_text(row, end_row) + "\n", True)
+        if char == "y":
+            self.move_cursor((row, 0))
+        elif char == "c":
+            end_col = len(self.document.get_line(end_row))
+            self.delete((row, 0), (end_row, end_col))
+            self.move_cursor((row, 0))
+        else:  # d / x: remove the lines entirely, dd-style
+            self.move_cursor((row, 0))
+            self._delete_lines(end_row - row + 1)
+        self._set_mode(INSERT if char == "c" else NORMAL)
 
     def _visual_operate(self, char: str) -> None:
         sel = self.selection

@@ -13,7 +13,12 @@ from textual.widgets import Input, Markdown, Static, TextArea
 
 from .editor import VimTextArea
 
-MODE_COLORS = {"normal": "blue", "insert": "green", "visual": "magenta"}
+MODE_STYLES = {
+    "normal": ("NORMAL", "blue"),
+    "insert": ("INSERT", "green"),
+    "visual": ("VISUAL", "magenta"),
+    "visual_line": ("V-LINE", "magenta"),
+}
 
 
 class CommandLine(Input):
@@ -105,12 +110,12 @@ class EasyMDApp(App):
         except Exception:
             return
         ed = self.editor
-        mode = ed.mode
+        label, color = MODE_STYLES[ed.mode]
         row, col = ed.cursor_location
         flag = " ●" if self.modified else ""
         notice = f"  {escape(self._notice)}" if self._notice else ""
         status.update(
-            f"[bold white on {MODE_COLORS[mode]}] {mode.upper()} [/] "
+            f"[bold white on {color}] {label} [/] "
             f"{escape(self.path.name)}{flag}{notice}"
             f"[dim]  {row + 1}:{col + 1}[/]"
         )
