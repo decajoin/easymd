@@ -1,16 +1,40 @@
 [project]
-name = "easymd"
+name = "easymd-cli"
 version = "0.1.0"
 description = "Terminal Markdown editor with vim-style keys and live side-by-side preview"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+authors = [{ name = "Yiqi Yang", email = "yangyiqi5261@gmail.com" }]
+keywords = ["markdown", "vim", "tui", "editor", "terminal", "textual"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Editors",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
 dependencies = ["textual[syntax]>=8.0"]
 
 [project.scripts]
 easymd = "easymd.cli:main"
 
+[project.urls]
+Repository = "https://github.com/decajoin/easymd"
+Issues = "https://github.com/decajoin/easymd/issues"
+
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/easymd"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "demo.md", "README.md", "LICENSE"]
