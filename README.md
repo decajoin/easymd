@@ -4,7 +4,7 @@
 
 ## 安装
 
-需要 Python 3.11+。
+需要 Python 3.10+。
 
 使用 [uv](https://docs.astral.sh/uv/)（推荐）：
 
