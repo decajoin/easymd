@@ -16,6 +16,7 @@ from .editor import VimTextArea
 MODE_STYLES = {
     "normal": ("NORMAL", "blue"),
     "insert": ("INSERT", "green"),
+    "replace": ("REPLACE", "red"),
     "visual": ("VISUAL", "magenta"),
     "visual_line": ("V-LINE", "magenta"),
 }
