@@ -4,21 +4,20 @@
 
 ## 安装
 
-需要 Python 3.10+。
-
-使用 [uv](https://docs.astral.sh/uv/)（推荐）：
+需要 Python 3.10+。推荐用 pip 或 [uv](https://docs.astral.sh/uv/) 从 PyPI 安装：
 
 ```bash
-uv sync
-uv run easymd demo.md
+pip install easymd-cli      # 或: uv tool install easymd-cli
+easymd 笔记.md               # 文件不存在时会在首次 :w 时创建
 ```
 
-或使用 pip：
+从源码开发：
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
-easymd demo.md        # 文件不存在时会在首次 :w 时创建
+git clone https://github.com/decajoin/easymd && cd easymd
+uv sync --group dev
+uv run easymd demo.md
+uv run pytest            # 运行测试
 ```
 
 ## 按键参考
@@ -28,6 +27,7 @@ easymd demo.md        # 文件不存在时会在首次 :w 时创建
 | 按键 | 作用 |
 | --- | --- |
 | `i` `a` `A` `I` `o` `O` | 进入插入模式（位置同 vim） |
+| `R` | 替换模式（连续覆写，退格可恢复被覆写的字符） |
 | `Esc` | 回到普通模式 |
 | `v` | 可视模式（`y`/`d`/`c` 作用于选区） |
 | `V` | 可视行模式（按整行选择，`y`/`d`/`c` 作用于整行；`v`/`V` 互切） |
@@ -41,8 +41,12 @@ easymd demo.md        # 文件不存在时会在首次 :w 时创建
 | 按键 | 作用 |
 | --- | --- |
 | `x` | 删除光标处字符 |
+| `r` / `~` | 替换光标处字符 / 切换大小写（支持计数） |
+| `J` | 合并下一行（`3J` 合并三行） |
 | `dd` / `yy` / `cc` | 删除 / 复制 / 改写整行（支持 `3dd`） |
-| `dw` `de` `d$` 等 | 操作符 + 移动（`y`、`c` 同理） |
+| `D` / `C` / `Y` | 删除至行尾 / 改写至行尾 / 复制整行 |
+| `dw` `de` `d$` 等 | 操作符 + 移动（`y`、`c` 同理；`cw` 同 vim 不吃尾随空格） |
+| `diw` `ci"` `ya(` 等 | 文本对象：`i`/`a` + `w` `"` `'` `` ` `` `(` `[` `{`，配 `d/c/y` 或可视模式 |
 | `p` / `P` | 在后 / 前粘贴 |
 | `u` / `Ctrl+r` | 撤销 / 重做 |
 
@@ -61,8 +65,7 @@ src/easymd/
   cli.py     # 命令行入口
   app.py     # 分屏布局、状态栏、命令行、预览同步
   editor.py  # vim 模态层（TextArea 子类）
-tests/
-  smoke_test.py  # 无头冒烟测试（Textual Pilot 驱动按键）
+tests/       # pytest 套件（Textual Pilot 无头驱动真实按键）
 ```
 
-运行测试：`uv run python tests/smoke_test.py`
+运行测试：`uv run pytest`

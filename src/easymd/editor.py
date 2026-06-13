@@ -14,6 +14,7 @@ WORD_RE = re.compile(r"\w+|[^\w\s]+")
 
 NORMAL = "normal"
 INSERT = "insert"
+REPLACE = "replace"
 VISUAL = "visual"
 VISUAL_LINE = "visual_line"
 
@@ -42,6 +43,9 @@ class VimTextArea(TextArea):
         self._register: tuple[str, bool] = ("", False)  # (text, linewise)
         self._search = ""
         self._line_anchor = 0  # anchor row for visual line mode
+        # Chars overwritten in the current R session, for backspace-restore:
+        # (location, original char) or (location, None) when appended.
+        self._replace_stack: list[tuple[tuple[int, int], str | None]] = []
 
     # ------------------------------------------------------------------
     # Modes
@@ -68,6 +72,11 @@ class VimTextArea(TextArea):
                 self._set_mode(NORMAL)
                 return
             await super()._on_key(event)
+            return
+        if self.mode == REPLACE:
+            event.stop()
+            event.prevent_default()
+            self._handle_replace_key(event)
             return
         # Normal / visual mode: nothing reaches the underlying TextArea.
         event.stop()
@@ -103,8 +112,23 @@ class VimTextArea(TextArea):
                 self._move((row, 0))
             return
 
+        if pending == "r":
+            if char:
+                self._replace_chars(char, n if explicit_count else 1)
+            return
+
         if pending in ("d", "y", "c"):
+            if char in ("i", "a"):
+                self._pending = pending + char
+                return
             self._handle_operator(pending, char, key, n, explicit_count)
+            return
+
+        # Second half of a text object: d/y/c/v + i/a + object key.
+        if len(pending) == 2:
+            object_range = self._text_object_range(char, around=pending[1] == "a")
+            if object_range is not None:
+                self._apply_text_object(pending[0], *object_range)
             return
 
         # Visual-mode operators act on the selection.
@@ -115,6 +139,11 @@ class VimTextArea(TextArea):
             if self.mode == VISUAL_LINE:
                 self._visual_line_operate(char)
                 return
+
+        # Text objects in (charwise) visual mode: i/a + object key.
+        if self.mode == VISUAL and char in ("i", "a"):
+            self._pending = "v" + char
+            return
 
         # Plain motions (extend the selection in visual mode).
         target = self._motion_target(char or key, n, explicit_count)
@@ -183,6 +212,31 @@ class VimTextArea(TextArea):
             if end > col:
                 self._register = (self.get_text_range((row, col), (row, end)), False)
                 self.delete((row, col), (row, end))
+        elif char == "r":
+            self._pending = "r"
+            if explicit_count:
+                self._count = str(n)
+        elif char == "R":
+            self._replace_stack.clear()
+            self._set_mode(REPLACE)
+        elif char == "J":
+            self._join_lines(max(1, n - 1) if explicit_count else 1)
+        elif char == "~":
+            line = doc.get_line(row)
+            end = min(len(line), col + n)
+            if end > col:
+                swapped = line[col:end].swapcase()
+                self.replace(
+                    swapped, (row, col), (row, end), maintain_selection_offset=False
+                )
+                self.move_cursor((row, min(end, max(0, len(line) - 1))))
+        elif char == "D":
+            self._operate_range("d", (row, col), (row, len(doc.get_line(row))))
+        elif char == "C":
+            self._operate_range("c", (row, col), (row, len(doc.get_line(row))))
+        elif char == "Y":
+            end_row = min(row + n - 1, doc.line_count - 1)
+            self._register = (self._line_range_text(row, end_row) + "\n", True)
         elif char in ("d", "y", "c"):
             self._pending = char
             if explicit_count:
@@ -354,6 +408,9 @@ class VimTextArea(TextArea):
                 self._set_mode(INSERT)
             return
 
+        # Vim quirk: cw behaves like ce (it does not eat trailing whitespace).
+        if op == "c" and char == "w":
+            char = "e"
         target = self._motion_target(char or key, n, explicit_count)
         if target is None:
             return
@@ -363,14 +420,20 @@ class VimTextArea(TextArea):
         elif char == "e":
             # 'e' is an inclusive motion: take the character under the target too.
             target = (target[0], target[1] + 1)
-        text = self.get_text_range(start, target)
+        self._operate_range(op, start, target)
+
+    def _operate_range(
+        self, op: str, start: tuple[int, int], end: tuple[int, int]
+    ) -> None:
+        """Yank, delete or change an arbitrary charwise range."""
+        text = self.get_text_range(start, end)
         if not text:
             return
         self._register = (text, False)
         if op == "y":
             self.move_cursor(start)
             return
-        self.delete(start, target)
+        self.delete(start, end)
         if op == "c":
             self._set_mode(INSERT)
 
@@ -402,6 +465,237 @@ class VimTextArea(TextArea):
         else:  # d / x / c
             self.delete(start, end)
         self._set_mode(INSERT if char == "c" else NORMAL)
+
+    # ------------------------------------------------------------------
+    # Replace mode (R)
+
+    def _handle_replace_key(self, event: events.Key) -> None:
+        key = event.key
+        if key == "escape":
+            row, col = self.cursor_location
+            if col > 0:
+                self.move_cursor((row, col - 1))
+            self._set_mode(NORMAL)
+            return
+        if key == "backspace":
+            self._replace_backspace()
+            return
+        if key == "enter":
+            self._replace_stack.append((self.cursor_location, None))
+            self.insert("\n")
+            return
+        if key in ("left", "right", "up", "down", "home", "end"):
+            # Moving the cursor starts a fresh overwrite run, as in vim.
+            self._replace_stack.clear()
+            target = self._motion_target(key, 1, False)
+            if target is not None:
+                self.move_cursor(target)
+            return
+        if event.is_printable and event.character:
+            self._overwrite_char(event.character)
+
+    def _overwrite_char(self, char: str) -> None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        if col < len(line):
+            self._replace_stack.append(((row, col), line[col]))
+            self.replace(
+                char, (row, col), (row, col + 1), maintain_selection_offset=False
+            )
+        else:  # past end of line: R appends, like vim
+            self._replace_stack.append(((row, col), None))
+            self.insert(char)
+
+    def _replace_backspace(self) -> None:
+        """Backspace in R mode restores what the current run overwrote."""
+        if not self._replace_stack:
+            row, col = self.cursor_location
+            if col > 0:
+                self.move_cursor((row, col - 1))
+            return
+        (row, col), original = self._replace_stack.pop()
+        if original is None:
+            # An appended char (or newline): just remove it again.
+            line = self.document.get_line(row)
+            end = (row + 1, 0) if col >= len(line) else (row, col + 1)
+            self.delete((row, col), end)
+        else:
+            self.replace(
+                original, (row, col), (row, col + 1), maintain_selection_offset=False
+            )
+        self.move_cursor((row, col))
+
+    # ------------------------------------------------------------------
+    # Single-key edits (r / J)
+
+    def _replace_chars(self, char: str, n: int) -> None:
+        """Vim r: overwrite n characters under the cursor with `char`."""
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        if col + n > len(line):  # vim refuses if the count overruns the line
+            return
+        self.replace(
+            char * n, (row, col), (row, col + n), maintain_selection_offset=False
+        )
+        self.move_cursor((row, col + n - 1))
+
+    def _join_lines(self, joins: int) -> None:
+        """Vim J: join with the next line, collapsing its indent to one space."""
+        for _ in range(joins):
+            doc = self.document
+            row, _ = self.cursor_location
+            if row >= doc.line_count - 1:
+                return
+            current = doc.get_line(row)
+            nxt = doc.get_line(row + 1)
+            glue = " " if current and nxt.strip() else ""
+            self.replace(
+                glue + nxt.lstrip(),
+                (row, len(current)),
+                (row + 1, len(nxt)),
+                maintain_selection_offset=False,
+            )
+            self.move_cursor((row, len(current)))
+
+    # ------------------------------------------------------------------
+    # Text objects (iw/aw, quotes, brackets)
+
+    def _apply_text_object(
+        self, op: str, start: tuple[int, int], end: tuple[int, int]
+    ) -> None:
+        if op == "v":
+            # Our visual operators re-add the character under the cursor, so
+            # park the selection end one character before the exclusive end.
+            self.selection = Selection(start, self._loc_before(end))
+            return
+        self._operate_range(op, start, end)
+
+    def _loc_before(self, loc: tuple[int, int]) -> tuple[int, int]:
+        row, col = loc
+        if col > 0:
+            return (row, col - 1)
+        if row > 0:
+            return (row - 1, len(self.document.get_line(row - 1)))
+        return loc
+
+    def _text_object_range(
+        self, obj: str | None, around: bool
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        if obj == "w":
+            return self._word_object(around)
+        if obj in ('"', "'", "`"):
+            return self._quote_object(obj, around)
+        if obj in ("(", ")", "b"):
+            return self._bracket_object("(", ")", around)
+        if obj in ("[", "]"):
+            return self._bracket_object("[", "]", around)
+        if obj in ("{", "}", "B"):
+            return self._bracket_object("{", "}", around)
+        return None
+
+    def _word_object(
+        self, around: bool
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        if not line:
+            return None
+        col = min(col, len(line) - 1)
+        for match in WORD_RE.finditer(line):
+            if match.start() <= col < match.end():
+                start, end = match.start(), match.end()
+                if around:
+                    # aw takes trailing whitespace, or leading if there is none.
+                    new_end = end
+                    while new_end < len(line) and line[new_end] == " ":
+                        new_end += 1
+                    if new_end == end:
+                        while start > 0 and line[start - 1] == " ":
+                            start -= 1
+                    end = new_end
+                return ((row, start), (row, end))
+        # Cursor on whitespace: iw is the whitespace run, aw adds the next word.
+        start = col
+        while start > 0 and line[start - 1] == " ":
+            start -= 1
+        end = col
+        while end < len(line) and line[end] == " ":
+            end += 1
+        if around:
+            match = WORD_RE.match(line, end)
+            if match:
+                end = match.end()
+        return ((row, start), (row, end))
+
+    def _quote_object(
+        self, quote: str, around: bool
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        positions = [i for i, ch in enumerate(line) if ch == quote]
+        for open_at, close_at in zip(positions[0::2], positions[1::2]):
+            if col <= close_at:
+                if around:
+                    return ((row, open_at), (row, close_at + 1))
+                return ((row, open_at + 1), (row, close_at))
+        return None
+
+    def _bracket_object(
+        self, open_ch: str, close_ch: str, around: bool
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        under = line[col] if col < len(line) else ""
+        if under == open_ch:
+            open_at = (row, col)
+        else:
+            # When sitting on the closing bracket, search left of it so the
+            # scan finds this pair's opening bracket rather than an outer one.
+            from_col = col - 1 if under == close_ch else col
+            open_at = self._scan_bracket_back(open_ch, close_ch, row, from_col)
+        if open_at is None:
+            return None
+        close_at = self._scan_bracket_fwd(
+            open_ch, close_ch, open_at[0], open_at[1] + 1
+        )
+        if close_at is None:
+            return None
+        if around:
+            return (open_at, (close_at[0], close_at[1] + 1))
+        return ((open_at[0], open_at[1] + 1), close_at)
+
+    def _scan_bracket_back(
+        self, open_ch: str, close_ch: str, row: int, col: int
+    ) -> tuple[int, int] | None:
+        doc = self.document
+        depth = 0
+        for r in range(row, -1, -1):
+            line = doc.get_line(r)
+            start = min(col, len(line) - 1) if r == row else len(line) - 1
+            for i in range(start, -1, -1):
+                if line[i] == close_ch:
+                    depth += 1
+                elif line[i] == open_ch:
+                    if depth == 0:
+                        return (r, i)
+                    depth -= 1
+        return None
+
+    def _scan_bracket_fwd(
+        self, open_ch: str, close_ch: str, row: int, col: int
+    ) -> tuple[int, int] | None:
+        doc = self.document
+        depth = 0
+        for r in range(row, doc.line_count):
+            line = doc.get_line(r)
+            for i in range(col if r == row else 0, len(line)):
+                if line[i] == open_ch:
+                    depth += 1
+                elif line[i] == close_ch:
+                    if depth == 0:
+                        return (r, i)
+                    depth -= 1
+        return None
 
     # ------------------------------------------------------------------
     # Paste

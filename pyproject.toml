@@ -30,6 +30,13 @@ easymd = "easymd.cli:main"
 Repository = "https://github.com/decajoin/easymd"
 Issues = "https://github.com/decajoin/easymd/issues"
 
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
