@@ -42,10 +42,18 @@ class VimTextArea(TextArea):
         self._pending = ""  # pending operator/prefix: d, y, c or g
         self._register: tuple[str, bool] = ("", False)  # (text, linewise)
         self._search = ""
+        self._search_whole = False  # whole-word match (set by * and #)
         self._line_anchor = 0  # anchor row for visual line mode
         # Chars overwritten in the current R session, for backspace-restore:
         # (location, original char) or (location, None) when appended.
         self._replace_stack: list[tuple[tuple[int, int], str | None]] = []
+        # Inline find (f/F/t/T) state for ; and , repeats: (cmd, char).
+        self._last_find: tuple[str, str] | None = None
+        # Dot-repeat: the last buffer-modifying change, as a replayable dict.
+        self._last_change: dict | None = None
+        self._change_capture: dict | None = None  # insert change being recorded
+        self._insert_text = ""  # text typed during the captured insert
+        self._replaying = False  # guard so replay does not re-record
 
     # ------------------------------------------------------------------
     # Modes
@@ -66,11 +74,19 @@ class VimTextArea(TextArea):
             if event.key == "escape":
                 event.stop()
                 event.prevent_default()
+                self._finalize_insert_change()
                 row, col = self.cursor_location
                 if col > 0:
                     self.move_cursor((row, col - 1))
                 self._set_mode(NORMAL)
                 return
+            if self._change_capture is not None:
+                if event.key == "enter":
+                    self._insert_text += "\n"
+                elif event.key == "backspace":
+                    self._insert_text = self._insert_text[:-1]
+                elif event.is_printable and event.character:
+                    self._insert_text += event.character
             await super()._on_key(event)
             return
         if self.mode == REPLACE:
@@ -124,11 +140,27 @@ class VimTextArea(TextArea):
             self._handle_operator(pending, char, key, n, explicit_count)
             return
 
+        # Resolve a pending inline find (f/F/t/T), possibly after an operator
+        # (df, / yt) — pending is the op prefix plus the find command.
+        if pending and pending[-1] in "fFtT":
+            if char:
+                self._resolve_find(pending[:-1], pending[-1], char, n)
+            return
+
         # Second half of a text object: d/y/c/v + i/a + object key.
         if len(pending) == 2:
-            object_range = self._text_object_range(char, around=pending[1] == "a")
+            op, around = pending[0], pending[1] == "a"
+            object_range = self._text_object_range(char, around=around)
             if object_range is not None:
-                self._apply_text_object(pending[0], *object_range)
+                self._apply_text_object(op, *object_range)
+                if op == "d":
+                    self._record(
+                        {"type": "delete_textobj", "obj": char, "around": around}
+                    )
+                elif op == "c":
+                    self._begin_insert_change(
+                        {"type": "change_textobj", "obj": char, "around": around}
+                    )
             return
 
         # Visual-mode operators act on the selection.
@@ -184,34 +216,37 @@ class VimTextArea(TextArea):
         row, col = self.cursor_location
 
         if char == "i":
+            self._begin_insert_change({"type": "insert", "kind": "i", "n": n})
             self._set_mode(INSERT)
         elif char == "a":
             line = doc.get_line(row)
             if col < len(line):
                 self.move_cursor((row, col + 1))
+            self._begin_insert_change({"type": "insert", "kind": "a", "n": n})
             self._set_mode(INSERT)
         elif char == "A":
             self.move_cursor((row, len(doc.get_line(row))))
+            self._begin_insert_change({"type": "insert", "kind": "A", "n": n})
             self._set_mode(INSERT)
         elif char == "I":
             line = doc.get_line(row)
             self.move_cursor((row, len(line) - len(line.lstrip())))
+            self._begin_insert_change({"type": "insert", "kind": "I", "n": n})
             self._set_mode(INSERT)
         elif char == "o":
             self.move_cursor((row, len(doc.get_line(row))))
             self.insert("\n")
+            self._begin_insert_change({"type": "insert", "kind": "o", "n": n})
             self._set_mode(INSERT)
         elif char == "O":
             self.move_cursor((row, 0))
             self.insert("\n")
             self.move_cursor((row, 0))
+            self._begin_insert_change({"type": "insert", "kind": "O", "n": n})
             self._set_mode(INSERT)
         elif char == "x":
-            line = doc.get_line(row)
-            end = min(len(line), col + n)
-            if end > col:
-                self._register = (self.get_text_range((row, col), (row, end)), False)
-                self.delete((row, col), (row, end))
+            self._do_x(n)
+            self._record({"type": "x", "n": n})
         elif char == "r":
             self._pending = "r"
             if explicit_count:
@@ -220,23 +255,33 @@ class VimTextArea(TextArea):
             self._replace_stack.clear()
             self._set_mode(REPLACE)
         elif char == "J":
-            self._join_lines(max(1, n - 1) if explicit_count else 1)
+            joins = max(1, n - 1) if explicit_count else 1
+            self._join_lines(joins)
+            self._record({"type": "join", "n": joins})
         elif char == "~":
-            line = doc.get_line(row)
-            end = min(len(line), col + n)
-            if end > col:
-                swapped = line[col:end].swapcase()
-                self.replace(
-                    swapped, (row, col), (row, end), maintain_selection_offset=False
-                )
-                self.move_cursor((row, min(end, max(0, len(line) - 1))))
+            self._do_tilde(n)
+            self._record({"type": "tilde", "n": n})
         elif char == "D":
             self._operate_range("d", (row, col), (row, len(doc.get_line(row))))
+            self._record({"type": "delete_eol"})
         elif char == "C":
             self._operate_range("c", (row, col), (row, len(doc.get_line(row))))
+            self._begin_insert_change({"type": "change_eol"})
         elif char == "Y":
             end_row = min(row + n - 1, doc.line_count - 1)
             self._register = (self._line_range_text(row, end_row) + "\n", True)
+        elif char in ("f", "F", "t", "T"):
+            self._pending = char
+            if explicit_count:
+                self._count = str(n)
+        elif char == ";":
+            self._repeat_find(reverse=False, n=n)
+        elif char == ",":
+            self._repeat_find(reverse=True, n=n)
+        elif char in ("*", "#"):
+            self._search_word(reverse=char == "#")
+        elif char == ".":
+            self._repeat_change(n, explicit_count)
         elif char in ("d", "y", "c"):
             self._pending = char
             if explicit_count:
@@ -268,8 +313,10 @@ class VimTextArea(TextArea):
                 self._update_linewise_selection()
         elif char == "p":
             self._paste(after=True, n=n)
+            self._record({"type": "paste", "after": True, "n": n})
         elif char == "P":
             self._paste(after=False, n=n)
+            self._record({"type": "paste", "after": False, "n": n})
         elif char == "u":
             self.undo()
         elif key == "ctrl+r":
@@ -326,6 +373,12 @@ class VimTextArea(TextArea):
             return self._next_word(n, end=True)
         if sym == "b":
             return self._prev_word(n)
+        if sym == "}":
+            return self._paragraph(forward=True, n=n)
+        if sym == "{":
+            return self._paragraph(forward=False, n=n)
+        if sym == "%":
+            return self._match_bracket()
         return None
 
     def _next_word(self, n: int, end: bool) -> tuple[int, int]:
@@ -392,6 +445,17 @@ class VimTextArea(TextArea):
     def _handle_operator(
         self, op: str, char: str | None, key: str, n: int, explicit_count: bool
     ) -> None:
+        # Inline find after an operator (df, / ct.): wait for the target char.
+        if char in ("f", "F", "t", "T"):
+            self._pending = op + char
+            if explicit_count:
+                self._count = str(n)
+            return
+        # Repeat the last inline find as the operator's motion (d; / c,).
+        if char in (";", ","):
+            self._operate_find_repeat(op, char == ",", n)
+            return
+
         # Doubled operator (dd / yy / cc) works on whole lines.
         if char == op:
             row, _ = self.cursor_location
@@ -400,11 +464,13 @@ class VimTextArea(TextArea):
                 self._register = (self._line_range_text(row, end_row) + "\n", True)
             elif op == "d":
                 self._delete_lines(n)
+                self._record({"type": "delete_lines", "n": n})
             else:  # cc: clear the lines' content and start inserting
                 self._register = (self._line_range_text(row, end_row) + "\n", True)
                 end_col = len(self.document.get_line(end_row))
                 self.delete((row, 0), (end_row, end_col))
                 self.move_cursor((row, 0))
+                self._begin_insert_change({"type": "change_line", "n": n})
                 self._set_mode(INSERT)
             return
 
@@ -415,12 +481,24 @@ class VimTextArea(TextArea):
         if target is None:
             return
         start = self.cursor_location
+        # f/F/t/T were handled above; % and forward inclusive motions take the
+        # character under the target too.
+        inclusive = char in ("e", "%")
         if target < start:
             start, target = target, start
-        elif char == "e":
-            # 'e' is an inclusive motion: take the character under the target too.
+            if char == "%":  # cursor's bracket is part of the d% range
+                target = (target[0], target[1] + 1)
+        elif inclusive:
             target = (target[0], target[1] + 1)
         self._operate_range(op, start, target)
+        if op == "d":
+            self._record(
+                {"type": "delete_motion", "motion": char, "key": key, "n": n}
+            )
+        elif op == "c":
+            self._begin_insert_change(
+                {"type": "change_motion", "motion": char, "key": key, "n": n}
+            )
 
     def _operate_range(
         self, op: str, start: tuple[int, int], end: tuple[int, int]
@@ -538,6 +616,28 @@ class VimTextArea(TextArea):
             char * n, (row, col), (row, col + n), maintain_selection_offset=False
         )
         self.move_cursor((row, col + n - 1))
+        self._record({"type": "replace", "char": char, "n": n})
+
+    def _do_x(self, n: int) -> None:
+        """Delete n characters under and after the cursor."""
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        end = min(len(line), col + n)
+        if end > col:
+            self._register = (self.get_text_range((row, col), (row, end)), False)
+            self.delete((row, col), (row, end))
+
+    def _do_tilde(self, n: int) -> None:
+        """Toggle case of n characters under the cursor and advance."""
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        end = min(len(line), col + n)
+        if end > col:
+            swapped = line[col:end].swapcase()
+            self.replace(
+                swapped, (row, col), (row, end), maintain_selection_offset=False
+            )
+            self.move_cursor((row, min(end, max(0, len(line) - 1))))
 
     def _join_lines(self, joins: int) -> None:
         """Vim J: join with the next line, collapsing its indent to one space."""
@@ -698,6 +798,281 @@ class VimTextArea(TextArea):
         return None
 
     # ------------------------------------------------------------------
+    # Dot-repeat (.)
+
+    def _record(self, change: dict) -> None:
+        """Remember the last buffer change for `.` (no-op while replaying)."""
+        if not self._replaying:
+            self._last_change = change
+            self._change_capture = None
+
+    def _begin_insert_change(self, change: dict) -> None:
+        """Start capturing typed text for a change that enters insert mode."""
+        if self._replaying:
+            return
+        self._change_capture = change
+        self._insert_text = ""
+
+    def _finalize_insert_change(self) -> None:
+        """On leaving insert mode, freeze the captured text into the change."""
+        if self._change_capture is not None:
+            self._change_capture["text"] = self._insert_text
+            self._last_change = self._change_capture
+            self._change_capture = None
+
+    def _advance(self, pos: tuple[int, int], text: str) -> tuple[int, int]:
+        """Location of the last character of `text` inserted at `pos`."""
+        if "\n" not in text:
+            return (pos[0], pos[1] + len(text) - 1)
+        rows = text.split("\n")
+        return (pos[0] + len(rows) - 1, max(0, len(rows[-1]) - 1))
+
+    def _insert_text_at_cursor(self, text: str) -> None:
+        if not text:
+            return
+        pos = self.cursor_location
+        self.insert(text, pos, maintain_selection_offset=False)
+        self.move_cursor(self._advance(pos, text))
+
+    def _repeat_change(self, count: int, explicit: bool) -> None:
+        change = self._last_change
+        if not change:
+            return
+        self._replaying = True
+        try:
+            n = count if explicit else change.get("n", 1)
+            self._dispatch_repeat(change, n)
+        finally:
+            self._replaying = False
+
+    def _dispatch_repeat(self, change: dict, n: int) -> None:
+        t = change["type"]
+        if t == "x":
+            self._do_x(n)
+        elif t == "tilde":
+            self._do_tilde(n)
+        elif t == "join":
+            self._join_lines(n)
+        elif t == "replace":
+            self._replace_chars(change["char"], n)
+        elif t == "paste":
+            self._paste(change["after"], n)
+        elif t == "delete_lines":
+            self._delete_lines(n)
+        elif t == "delete_eol":
+            row, col = self.cursor_location
+            self._operate_range(
+                "d", (row, col), (row, len(self.document.get_line(row)))
+            )
+        elif t == "delete_motion":
+            self._handle_operator("d", change["motion"], change["key"], n, True)
+        elif t == "delete_textobj":
+            rng = self._text_object_range(change["obj"], change["around"])
+            if rng:
+                self._operate_range("d", *rng)
+        elif t == "delete_find":
+            self._operate_find_with("d", change["cmd"], change["char"], n)
+        elif t == "insert":
+            self._replay_insert(change, n)
+        elif t == "change_motion":
+            self._handle_operator("d", change["motion"], change["key"], n, True)
+            self._insert_text_at_cursor(change.get("text", ""))
+        elif t == "change_textobj":
+            rng = self._text_object_range(change["obj"], change["around"])
+            if rng:
+                self._operate_range("d", *rng)
+            self._insert_text_at_cursor(change.get("text", ""))
+        elif t == "change_find":
+            self._operate_find_with("d", change["cmd"], change["char"], n)
+            self._insert_text_at_cursor(change.get("text", ""))
+        elif t == "change_eol":
+            row, col = self.cursor_location
+            self._operate_range(
+                "d", (row, col), (row, len(self.document.get_line(row)))
+            )
+            self._insert_text_at_cursor(change.get("text", ""))
+        elif t == "change_line":
+            row, _ = self.cursor_location
+            end_row = min(row + n - 1, self.document.line_count - 1)
+            self.delete((row, 0), (end_row, len(self.document.get_line(end_row))))
+            self.move_cursor((row, 0))
+            self._insert_text_at_cursor(change.get("text", ""))
+
+    def _replay_insert(self, change: dict, n: int) -> None:
+        kind = change["kind"]
+        text = change.get("text", "") * max(1, n)
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        if kind == "a":
+            pos = (row, min(col + 1, len(line)))
+        elif kind == "A":
+            pos = (row, len(line))
+        elif kind == "I":
+            pos = (row, len(line) - len(line.lstrip()))
+        elif kind == "o":
+            self.insert("\n", (row, len(line)))
+            pos = (row + 1, 0)
+        elif kind == "O":
+            self.insert("\n", (row, 0))
+            pos = (row, 0)
+        else:  # "i"
+            pos = (row, col)
+        if text:
+            self.insert(text, pos, maintain_selection_offset=False)
+            self.move_cursor(self._advance(pos, text))
+
+    # ------------------------------------------------------------------
+    # Inline find (f/F/t/T, ; ,)
+
+    _FIND_FLIP = {"f": "F", "F": "f", "t": "T", "T": "t"}
+
+    def _find_motion(
+        self, cmd: str, char: str, n: int, repeat: bool = False
+    ) -> tuple[int, int] | None:
+        """Column of the n-th f/F/t/T match on the current line, or None."""
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        forward = cmd in ("f", "t")
+        till = cmd in ("t", "T")
+        idx = col
+        # A repeated t/T must step over the adjacent target so ; advances.
+        if repeat and till:
+            idx = col + 1 if forward else col - 1
+        for _ in range(n):
+            idx = line.find(char, idx + 1) if forward else line.rfind(char, 0, idx)
+            if idx == -1:
+                return None
+        if till:
+            idx += -1 if forward else 1
+        return (row, idx)
+
+    def _operate_to_target_inclusive(
+        self, op: str, target: tuple[int, int]
+    ) -> None:
+        start = self.cursor_location
+        if target >= start:
+            self._operate_range(op, start, (target[0], target[1] + 1))
+        else:
+            self._operate_range(op, target, start)
+
+    def _resolve_find(self, op: str, cmd: str, char: str, n: int) -> None:
+        target = self._find_motion(cmd, char, n)
+        if target is None:
+            return
+        self._last_find = (cmd, char)
+        if not op:
+            self._move(target)
+            return
+        self._operate_to_target_inclusive(op, target)
+        if op == "d":
+            self._record(
+                {"type": "delete_find", "cmd": cmd, "char": char, "n": n}
+            )
+        elif op == "c":
+            self._begin_insert_change(
+                {"type": "change_find", "cmd": cmd, "char": char, "n": n}
+            )
+
+    def _operate_find_with(self, op: str, cmd: str, char: str, n: int) -> None:
+        target = self._find_motion(cmd, char, n)
+        if target is not None:
+            self._operate_to_target_inclusive(op, target)
+
+    def _repeat_find(self, reverse: bool, n: int) -> None:
+        if not self._last_find:
+            return
+        cmd, char = self._last_find
+        if reverse:
+            cmd = self._FIND_FLIP[cmd]
+        target = self._find_motion(cmd, char, n, repeat=True)
+        if target is not None:
+            self._move(target)
+
+    def _operate_find_repeat(self, op: str, reverse: bool, n: int) -> None:
+        if not self._last_find:
+            return
+        cmd, char = self._last_find
+        if reverse:
+            cmd = self._FIND_FLIP[cmd]
+        target = self._find_motion(cmd, char, n, repeat=True)
+        if target is not None:
+            self._operate_to_target_inclusive(op, target)
+
+    # ------------------------------------------------------------------
+    # Bracket match (%) and paragraph motion ({ })
+
+    def _match_bracket(self) -> tuple[int, int] | None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        opens = {"(": ")", "[": "]", "{": "}"}
+        closes = {v: k for k, v in opens.items()}
+        i = col
+        while i < len(line) and line[i] not in opens and line[i] not in closes:
+            i += 1
+        if i >= len(line):
+            return None
+        ch = line[i]
+        if ch in opens:
+            return self._scan_bracket_fwd(ch, opens[ch], row, i + 1)
+        return self._scan_bracket_back(closes[ch], ch, row, i - 1)
+
+    def _paragraph(self, forward: bool, n: int) -> tuple[int, int]:
+        doc = self.document
+        row = self.cursor_location[0]
+        last = doc.line_count - 1
+
+        def blank(r: int) -> bool:
+            return doc.get_line(r).strip() == ""
+
+        for _ in range(n):
+            if forward:
+                r = row + 1
+                while r < last and not blank(r):
+                    r += 1
+                row = r
+            else:
+                r = row - 1
+                while r > 0 and not blank(r):
+                    r -= 1
+                row = r
+        return (row, 0)
+
+    # ------------------------------------------------------------------
+    # Word search (* #)
+
+    @staticmethod
+    def _is_word_char(ch: str) -> bool:
+        return ch.isalnum() or ch == "_"
+
+    def _word_under_cursor(self) -> str | None:
+        row, col = self.cursor_location
+        line = self.document.get_line(row)
+        if col >= len(line):
+            return None
+        if not self._is_word_char(line[col]):
+            j = col
+            while j < len(line) and not self._is_word_char(line[j]):
+                j += 1
+            if j >= len(line):
+                return None
+            col = j
+        start = col
+        while start > 0 and self._is_word_char(line[start - 1]):
+            start -= 1
+        end = col
+        while end < len(line) and self._is_word_char(line[end]):
+            end += 1
+        return line[start:end]
+
+    def _search_word(self, reverse: bool) -> None:
+        word = self._word_under_cursor()
+        if not word:
+            return
+        self._search = word
+        self._search_whole = True
+        self.search_next(reverse=reverse)
+
+    # ------------------------------------------------------------------
     # Paste
 
     def _paste(self, after: bool, n: int = 1) -> None:
@@ -728,19 +1103,13 @@ class VimTextArea(TextArea):
 
     def set_search(self, pattern: str) -> None:
         self._search = pattern
+        self._search_whole = False  # plain / search matches substrings
         self.search_next()
 
     def search_next(self, reverse: bool = False) -> None:
         if not self._search:
             return
-        doc = self.document
-        matches: list[tuple[int, int]] = []
-        for r in range(doc.line_count):
-            line = doc.get_line(r)
-            i = line.find(self._search)
-            while i >= 0:
-                matches.append((r, i))
-                i = line.find(self._search, i + 1)
+        matches = self._search_matches()
         if not matches:
             return
         here = self.cursor_location
@@ -751,3 +1120,21 @@ class VimTextArea(TextArea):
             after = [m for m in matches if m > here]
             target = after[0] if after else matches[0]
         self.move_cursor(target)
+
+    def _search_matches(self) -> list[tuple[int, int]]:
+        pat = self._search
+        plen = len(pat)
+        matches: list[tuple[int, int]] = []
+        for r in range(self.document.line_count):
+            line = self.document.get_line(r)
+            i = line.find(pat)
+            while i >= 0:
+                if not self._search_whole or self._is_whole_word(line, i, plen):
+                    matches.append((r, i))
+                i = line.find(pat, i + 1)
+        return matches
+
+    def _is_whole_word(self, line: str, i: int, plen: int) -> bool:
+        left = i == 0 or not self._is_word_char(line[i - 1])
+        right = i + plen >= len(line) or not self._is_word_char(line[i + plen])
+        return left and right
