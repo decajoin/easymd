@@ -8,6 +8,7 @@ from rich.markup import escape
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
+from textual.geometry import Offset
 from textual.message import Message
 from textual.widgets import Input, Markdown, Static, TextArea
 
@@ -93,6 +94,12 @@ class EasyMDApp(App):
     def on_mount(self) -> None:
         self.editor.focus()
         self._update_status()
+        # Keep the preview aligned whenever the editor scrolls (cursor moves
+        # that scroll the viewport, wheel scrolling, page motions, …).
+        self.watch(self.editor, "scroll_y", self._on_editor_scroll, init=False)
+
+    def _on_editor_scroll(self, *_args) -> None:
+        self._sync_scroll()
 
     @property
     def editor(self) -> VimTextArea:
@@ -144,17 +151,62 @@ class EasyMDApp(App):
 
     async def _refresh_preview(self) -> None:
         await self.query_one("#preview", Markdown).update(self.editor.text)
-        self._sync_scroll()
+        # Re-sync once the new blocks have been laid out and measured.
+        self.call_after_refresh(self._sync_scroll)
+
+    def _editor_top_line(self) -> int:
+        """The document line currently at the top of the editor viewport."""
+        ed = self.editor
+        top = ed.scroll_offset.y
+        try:
+            # Account for soft-wrapped lines: a visual row maps to a doc line.
+            return ed.wrapped_document.offset_to_location(Offset(0, top))[0]
+        except Exception:
+            return top
+
+    def _preview_y_for_line(self, line: int) -> float | None:
+        """Map a source line to a y offset in the preview via block anchors.
+
+        Each rendered block knows the source range it came from and its own
+        position, so we interpolate piecewise-linearly between block edges —
+        this keeps tall blocks (code, tables) aligned, unlike a flat ratio.
+        """
+        try:
+            md = self.query_one("#preview", Markdown)
+        except Exception:
+            return None
+        anchors: list[tuple[int, int]] = []
+        for block in md.children:
+            source_range = getattr(block, "source_range", None)
+            if source_range is None:
+                continue
+            start, end = source_range
+            y0 = block.virtual_region.y
+            anchors.append((start, y0))
+            anchors.append((end, y0 + max(1, block.region.height)))
+        if not anchors:
+            return None
+        anchors.sort()
+        if line <= anchors[0][0]:
+            return float(anchors[0][1])
+        if line >= anchors[-1][0]:
+            return float(anchors[-1][1])
+        for (l0, y0), (l1, y1) in zip(anchors, anchors[1:]):
+            if l0 <= line <= l1:
+                if l1 == l0:
+                    return float(y0)
+                return y0 + (line - l0) / (l1 - l0) * (y1 - y0)
+        return float(anchors[-1][1])
 
     def _sync_scroll(self) -> None:
         try:
             scroller = self.query_one("#preview-scroll", VerticalScroll)
         except Exception:
             return
-        ed = self.editor
-        total = max(1, ed.document.line_count - 1)
-        fraction = ed.cursor_location[0] / total
-        scroller.scroll_to(y=fraction * scroller.max_scroll_y, animate=False)
+        y = self._preview_y_for_line(self._editor_top_line())
+        if y is None:
+            return
+        scroller.scroll_to(y=max(0, min(y, scroller.max_scroll_y)), animate=False)
 
     # ------------------------------------------------------------------
     # Command line (: and /)
