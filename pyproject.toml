@@ -1,6 +1,6 @@
 [project]
 name = "easymd-cli"
-version = "0.2.1"
+version = "0.2.2"
 description = "Terminal Markdown editor with vim-style keys and live side-by-side preview"
 readme = "README.md"
 license = "MIT"
