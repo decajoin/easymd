@@ -206,7 +206,20 @@ class EasyMDApp(App):
         y = self._preview_y_for_line(self._editor_top_line())
         if y is None:
             return
-        scroller.scroll_to(y=max(0, min(y, scroller.max_scroll_y)), animate=False)
+        preview_max = scroller.max_scroll_y
+        target = max(0, min(y, preview_max))
+        # Within the editor's final screenful, ease the preview toward its own
+        # bottom. A tail that renders taller than its source would otherwise be
+        # unreachable: the editor runs out of scroll before the preview does.
+        ed = self.editor
+        ed_max = ed.max_scroll_y
+        if ed_max > 0:
+            remaining = ed_max - ed.scroll_offset.y
+            view = max(1, ed.size.height)
+            if remaining < view:
+                t = 1 - remaining / view
+                target += t * (preview_max - target)
+        scroller.scroll_to(y=max(0, min(target, preview_max)), animate=False)
 
     # ------------------------------------------------------------------
     # Command line (: and /)
