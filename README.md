@@ -11,6 +11,12 @@ pip install easymd-cli      # 或: uv tool install easymd-cli
 easymd 笔记.md               # 文件不存在时会在首次 :w 时创建
 ```
 
+需要在编辑器里一键翻译预览（见下文「翻译预览」）时，装上可选依赖：
+
+```bash
+pip install 'easymd-cli[translate]'   # 或: uv tool install 'easymd-cli[translate]'
+```
+
 从源码开发：
 
 ```bash
@@ -65,15 +71,52 @@ uv run pytest            # 运行测试
 | `:w` `:w 文件名` | 保存 |
 | `:q` `:q!` `:wq` `:x` | 退出（有未保存修改时 `:q` 会拒绝） |
 | `/文本` 然后 `n` / `N` | 搜索 / 下一个 / 上一个 |
+| `:trans` | 切换右侧预览为译文 / 原文（见「翻译预览」） |
+| `:transback` | 切回原文预览 |
+| `:refresh` | 重新翻译（编辑后更新译文，只重翻改动段） |
+
+## 翻译预览（DeepSeek）
+
+装了 `[translate]` 可选依赖后，`:trans` 会把右侧预览整篇译成中文（默认）并缓存，
+再次 `:trans` 切回原文。译文按 Markdown 语义块切分、按内容缓存：编辑原文后状态栏会
+提示「译文已过期」，用 `:refresh` 只重翻改动的段落。译文模式下两栏不联动滚动，用滚轮
+独立翻页。翻译结果只影响预览，不会写回你的文件。
+
+### 配置 API key
+
+优先用环境变量，其次配置文件 `~/.config/easymd/config.toml`：
+
+```bash
+export DEEPSEEK_API_KEY=sk-...        # 推荐
+# 或交互式写入配置文件（权限 600）：
+easymd config set-key
+```
+
+配置文件示例：
+
+```toml
+[deepseek]
+api_key = "sk-..."          # 也可用 DEEPSEEK_API_KEY 环境变量（优先）
+model = "deepseek-v4-flash" # 可选 deepseek-v4-pro
+target_lang = "中文"
+```
+
+相关命令：`easymd config show`（查看解析后的配置，key 已脱敏）、
+`easymd config set-model deepseek-v4-pro`。也可在启动时覆盖：
+`easymd --pro 笔记.md`、`easymd --model <id> 笔记.md`、`easymd --lang English 笔记.md`。
+
+未装 `[translate]` 依赖或未配置 key 时，`:trans` 会在状态栏给出友好提示而不会崩溃。
 
 ## 项目结构
 
 ```
 src/easymd/
-  cli.py     # 命令行入口
-  app.py     # 分屏布局、状态栏、命令行、预览同步
-  editor.py  # vim 模态层（TextArea 子类）
-tests/       # pytest 套件（Textual Pilot 无头驱动真实按键）
+  cli.py        # 命令行入口（typer：easymd FILE / easymd config ...）
+  app.py        # 分屏布局、状态栏、命令行、预览同步、翻译视图状态机
+  editor.py     # vim 模态层（TextArea 子类）
+  config.py     # 读取 DeepSeek 配置（env > config.toml > 默认）
+  translate.py  # 分块 + 内容缓存 + DeepSeek 客户端（可选依赖）
+tests/          # pytest 套件（Textual Pilot 无头驱动真实按键）
 ```
 
 运行测试：`uv run pytest`

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from rich.markup import escape
-from textual import events
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.geometry import Offset
 from textual.message import Message
 from textual.widgets import Input, Markdown, Static, TextArea
 
+from .config import Config, load_config
 from .editor import VimTextArea
+from .translate import Translator, TranslateError
 
 MODE_STYLES = {
     "normal": ("NORMAL", "blue"),
@@ -66,7 +69,7 @@ class EasyMDApp(App):
     }
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, config: Config | None = None) -> None:
         super().__init__()
         self.path = path
         self._saved_text = (
@@ -74,6 +77,13 @@ class EasyMDApp(App):
         )
         self._preview_timer = None
         self._notice = ""
+        self._config = config or load_config()
+        self._translator = Translator(self._config)
+        # Preview window state: "original" shows editor.text, "translated"
+        # shows the cached translation (untouched by edits until :refresh).
+        self._preview_mode = "original"
+        self._translated_md = ""
+        self._translated_hash: str | None = None  # doc hash when translated
 
     # ------------------------------------------------------------------
     # Layout
@@ -121,10 +131,17 @@ class EasyMDApp(App):
         label, color = MODE_STYLES[ed.mode]
         row, col = ed.cursor_location
         flag = " ●" if self.modified else ""
+        preview_flag = ""
+        if self._preview_mode == "translated":
+            preview_flag = (
+                " [yellow]译文·已过期 :refresh[/]"
+                if self._translation_stale()
+                else " [cyan]译文[/]"
+            )
         notice = f"  {escape(self._notice)}" if self._notice else ""
         status.update(
             f"[bold white on {color}] {label} [/] "
-            f"{escape(self.path.name)}{flag}{notice}"
+            f"{escape(self.path.name)}{flag}{preview_flag}{notice}"
             f"[dim]  {row + 1}:{col + 1}[/]"
         )
 
@@ -132,9 +149,10 @@ class EasyMDApp(App):
     # Editor events
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        if self._preview_timer is not None:
-            self._preview_timer.stop()
-        self._preview_timer = self.set_timer(0.25, self._refresh_preview)
+        # In translation view the preview holds the cached translation until the
+        # user runs :refresh, so edits only refresh the status (staleness mark).
+        if self._preview_mode == "original":
+            self._render_preview_soon(0.25)
         self._update_status()
 
     def on_text_area_selection_changed(
@@ -149,8 +167,20 @@ class EasyMDApp(App):
         self._notice = ""
         self._update_status()
 
+    def _render_preview_soon(self, delay: float = 0.0) -> None:
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        # Textual's timer divides by the interval, so 0 is not allowed; a tiny
+        # positive delay is effectively immediate for an instant view toggle.
+        self._preview_timer = self.set_timer(max(delay, 0.01), self._refresh_preview)
+
     async def _refresh_preview(self) -> None:
-        await self.query_one("#preview", Markdown).update(self.editor.text)
+        content = (
+            self._translated_md
+            if self._preview_mode == "translated"
+            else self.editor.text
+        )
+        await self.query_one("#preview", Markdown).update(content)
         # Re-sync once the new blocks have been laid out and measured.
         self.call_after_refresh(self._sync_scroll)
 
@@ -199,6 +229,10 @@ class EasyMDApp(App):
         return float(anchors[-1][1])
 
     def _sync_scroll(self) -> None:
+        # The translation view scrolls independently: its lines don't map to the
+        # editor's source lines, so only the original view stays in lockstep.
+        if self._preview_mode != "original":
+            return
         try:
             scroller = self.query_one("#preview-scroll", VerticalScroll)
         except Exception:
@@ -220,6 +254,71 @@ class EasyMDApp(App):
                 t = 1 - remaining / view
                 target += t * (preview_max - target)
         scroller.scroll_to(y=max(0, min(target, preview_max)), animate=False)
+
+    # ------------------------------------------------------------------
+    # Translation preview
+
+    def _doc_hash(self) -> str:
+        return hashlib.sha256(self.editor.text.encode("utf-8")).hexdigest()
+
+    def _translation_stale(self) -> bool:
+        return (
+            self._preview_mode == "translated"
+            and self._translated_hash is not None
+            and self._translated_hash != self._doc_hash()
+        )
+
+    def _enter_translation_view(self) -> None:
+        self._preview_mode = "translated"
+        # An up-to-date cached translation switches in instantly; otherwise
+        # show a placeholder and translate in the background.
+        if self._translated_md and self._translated_hash == self._doc_hash():
+            self._render_preview_soon(0.0)
+        else:
+            self._start_translation()
+
+    def _exit_translation_view(self) -> None:
+        self._preview_mode = "original"
+        self._render_preview_soon(0.0)
+
+    def _refresh_translation(self) -> None:
+        if self._preview_mode != "translated":
+            self._notice = "E: 不在译文预览（先 :trans）"
+            return
+        self._start_translation()
+
+    def _start_translation(self) -> None:
+        self._translated_md = "> 翻译中…"
+        self._render_preview_soon(0.0)
+        self._translate_worker()
+
+    @work(exclusive=True, group="translate")
+    async def _translate_worker(self) -> None:
+        source_hash = self._doc_hash()
+        parts: list[str] = []
+
+        def on_chunk(translated: str, done: int, total: int) -> None:
+            parts.append(translated)
+            self._translated_md = "\n\n".join(parts)
+            self._notice = f"翻译中… {done}/{total}"
+            self._render_preview_soon(0.0)
+            self._update_status()
+
+        try:
+            await self._translator.translate_document(self.editor.text, on_chunk)
+        except TranslateError as error:
+            # Friendly fallback: revert to the original view, surface the reason.
+            self._preview_mode = "original"
+            self._translated_md = ""
+            self._translated_hash = None
+            self._notice = str(error)
+            self._render_preview_soon(0.0)
+            self._update_status()
+            return
+        self._translated_hash = source_hash
+        self._notice = "译文已更新"
+        self._render_preview_soon(0.0)
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Command line (: and /)
@@ -270,6 +369,15 @@ class EasyMDApp(App):
             self._notice = f'"{target}" written'
             if name in ("wq", "x"):
                 self.exit()
+        elif name == "trans":
+            if self._preview_mode == "translated":
+                self._exit_translation_view()
+            else:
+                self._enter_translation_view()
+        elif name in ("transback", "transorig"):
+            self._exit_translation_view()
+        elif name == "refresh":
+            self._refresh_translation()
         elif name in ("q", "q!", "qa", "qa!"):
             if name.endswith("!") or not self.modified:
                 self.exit()
