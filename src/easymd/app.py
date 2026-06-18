@@ -6,15 +6,16 @@ import hashlib
 from pathlib import Path
 
 from rich.markup import escape
-from textual import events
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.geometry import Offset
 from textual.message import Message
 from textual.widgets import Input, Markdown, Static, TextArea
 
-from .config import load_config
+from .config import Config, load_config
 from .editor import VimTextArea
+from .translate import Translator, TranslateError
 
 MODE_STYLES = {
     "normal": ("NORMAL", "blue"),
@@ -68,7 +69,7 @@ class EasyMDApp(App):
     }
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, config: Config | None = None) -> None:
         super().__init__()
         self.path = path
         self._saved_text = (
@@ -76,7 +77,8 @@ class EasyMDApp(App):
         )
         self._preview_timer = None
         self._notice = ""
-        self._config = load_config()
+        self._config = config or load_config()
+        self._translator = Translator(self._config)
         # Preview window state: "original" shows editor.text, "translated"
         # shows the cached translation (untouched by edits until :refresh).
         self._preview_mode = "original"
@@ -255,9 +257,6 @@ class EasyMDApp(App):
 
     # ------------------------------------------------------------------
     # Translation preview
-    #
-    # PR1 wires the view state machine; the actual DeepSeek translation lands
-    # in a follow-up. _build_translation is the seam to replace.
 
     def _doc_hash(self) -> str:
         return hashlib.sha256(self.editor.text.encode("utf-8")).hexdigest()
@@ -269,23 +268,14 @@ class EasyMDApp(App):
             and self._translated_hash != self._doc_hash()
         )
 
-    def _build_translation(self) -> None:
-        """Produce the translated Markdown for the current document.
-
-        PR1 placeholder: echoes the source so the view and state machine can be
-        exercised offline. A later PR replaces this with translate.py (chunking,
-        per-paragraph caching and the DeepSeek client).
-        """
-        self._translated_md = self.editor.text
-        self._translated_hash = self._doc_hash()
-        self._notice = "译文预览（占位：DeepSeek 翻译将在后续接入）"
-
     def _enter_translation_view(self) -> None:
-        # Reuse an up-to-date translation for an instant toggle.
-        if not (self._translated_md and self._translated_hash == self._doc_hash()):
-            self._build_translation()
         self._preview_mode = "translated"
-        self._render_preview_soon(0.0)
+        # An up-to-date cached translation switches in instantly; otherwise
+        # show a placeholder and translate in the background.
+        if self._translated_md and self._translated_hash == self._doc_hash():
+            self._render_preview_soon(0.0)
+        else:
+            self._start_translation()
 
     def _exit_translation_view(self) -> None:
         self._preview_mode = "original"
@@ -295,8 +285,40 @@ class EasyMDApp(App):
         if self._preview_mode != "translated":
             self._notice = "E: 不在译文预览（先 :trans）"
             return
-        self._build_translation()
+        self._start_translation()
+
+    def _start_translation(self) -> None:
+        self._translated_md = "> 翻译中…"
         self._render_preview_soon(0.0)
+        self._translate_worker()
+
+    @work(exclusive=True, group="translate")
+    async def _translate_worker(self) -> None:
+        source_hash = self._doc_hash()
+        parts: list[str] = []
+
+        def on_chunk(translated: str, done: int, total: int) -> None:
+            parts.append(translated)
+            self._translated_md = "\n\n".join(parts)
+            self._notice = f"翻译中… {done}/{total}"
+            self._render_preview_soon(0.0)
+            self._update_status()
+
+        try:
+            await self._translator.translate_document(self.editor.text, on_chunk)
+        except TranslateError as error:
+            # Friendly fallback: revert to the original view, surface the reason.
+            self._preview_mode = "original"
+            self._translated_md = ""
+            self._translated_hash = None
+            self._notice = str(error)
+            self._render_preview_soon(0.0)
+            self._update_status()
+            return
+        self._translated_hash = source_hash
+        self._notice = "译文已更新"
+        self._render_preview_soon(0.0)
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Command line (: and /)

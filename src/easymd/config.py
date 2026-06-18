@@ -34,6 +34,9 @@ PRO_MODEL = "deepseek-v4-pro"
 DEFAULT_MODEL = FLASH_MODEL
 DEFAULT_TARGET_LANG = "中文"
 
+# Keys we own in the config file and may (re)write via `easymd config`.
+WRITABLE_KEYS = ("api_key", "base_url", "model", "target_lang")
+
 
 def config_path() -> Path:
     override = os.environ.get("EASYMD_CONFIG")
@@ -91,3 +94,34 @@ def load_config() -> Config:
         model=model,
         target_lang=target_lang,
     )
+
+
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def save_config(updates: dict) -> Path:
+    """Merge `updates` into the config file and write it back (mode 0600).
+
+    Only WRITABLE_KEYS are persisted; None values are ignored. The file is
+    written as flat top-level keys, which the loader also accepts.
+    """
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    current = {k: v for k, v in _load_file().items() if k in WRITABLE_KEYS}
+    for key, value in updates.items():
+        if key in WRITABLE_KEYS and value is not None:
+            current[key] = value
+
+    lines = ["# easymd configuration\n"]
+    for key in WRITABLE_KEYS:
+        value = current.get(key)
+        if value:
+            lines.append(f'{key} = "{_toml_escape(str(value))}"\n')
+    path.write_text("".join(lines), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
