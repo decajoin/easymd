@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from rich.markup import escape
@@ -12,6 +13,7 @@ from textual.geometry import Offset
 from textual.message import Message
 from textual.widgets import Input, Markdown, Static, TextArea
 
+from .config import load_config
 from .editor import VimTextArea
 
 MODE_STYLES = {
@@ -74,6 +76,12 @@ class EasyMDApp(App):
         )
         self._preview_timer = None
         self._notice = ""
+        self._config = load_config()
+        # Preview window state: "original" shows editor.text, "translated"
+        # shows the cached translation (untouched by edits until :refresh).
+        self._preview_mode = "original"
+        self._translated_md = ""
+        self._translated_hash: str | None = None  # doc hash when translated
 
     # ------------------------------------------------------------------
     # Layout
@@ -121,10 +129,17 @@ class EasyMDApp(App):
         label, color = MODE_STYLES[ed.mode]
         row, col = ed.cursor_location
         flag = " ●" if self.modified else ""
+        preview_flag = ""
+        if self._preview_mode == "translated":
+            preview_flag = (
+                " [yellow]译文·已过期 :refresh[/]"
+                if self._translation_stale()
+                else " [cyan]译文[/]"
+            )
         notice = f"  {escape(self._notice)}" if self._notice else ""
         status.update(
             f"[bold white on {color}] {label} [/] "
-            f"{escape(self.path.name)}{flag}{notice}"
+            f"{escape(self.path.name)}{flag}{preview_flag}{notice}"
             f"[dim]  {row + 1}:{col + 1}[/]"
         )
 
@@ -132,9 +147,10 @@ class EasyMDApp(App):
     # Editor events
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        if self._preview_timer is not None:
-            self._preview_timer.stop()
-        self._preview_timer = self.set_timer(0.25, self._refresh_preview)
+        # In translation view the preview holds the cached translation until the
+        # user runs :refresh, so edits only refresh the status (staleness mark).
+        if self._preview_mode == "original":
+            self._render_preview_soon(0.25)
         self._update_status()
 
     def on_text_area_selection_changed(
@@ -149,8 +165,20 @@ class EasyMDApp(App):
         self._notice = ""
         self._update_status()
 
+    def _render_preview_soon(self, delay: float = 0.0) -> None:
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        # Textual's timer divides by the interval, so 0 is not allowed; a tiny
+        # positive delay is effectively immediate for an instant view toggle.
+        self._preview_timer = self.set_timer(max(delay, 0.01), self._refresh_preview)
+
     async def _refresh_preview(self) -> None:
-        await self.query_one("#preview", Markdown).update(self.editor.text)
+        content = (
+            self._translated_md
+            if self._preview_mode == "translated"
+            else self.editor.text
+        )
+        await self.query_one("#preview", Markdown).update(content)
         # Re-sync once the new blocks have been laid out and measured.
         self.call_after_refresh(self._sync_scroll)
 
@@ -199,6 +227,10 @@ class EasyMDApp(App):
         return float(anchors[-1][1])
 
     def _sync_scroll(self) -> None:
+        # The translation view scrolls independently: its lines don't map to the
+        # editor's source lines, so only the original view stays in lockstep.
+        if self._preview_mode != "original":
+            return
         try:
             scroller = self.query_one("#preview-scroll", VerticalScroll)
         except Exception:
@@ -220,6 +252,51 @@ class EasyMDApp(App):
                 t = 1 - remaining / view
                 target += t * (preview_max - target)
         scroller.scroll_to(y=max(0, min(target, preview_max)), animate=False)
+
+    # ------------------------------------------------------------------
+    # Translation preview
+    #
+    # PR1 wires the view state machine; the actual DeepSeek translation lands
+    # in a follow-up. _build_translation is the seam to replace.
+
+    def _doc_hash(self) -> str:
+        return hashlib.sha256(self.editor.text.encode("utf-8")).hexdigest()
+
+    def _translation_stale(self) -> bool:
+        return (
+            self._preview_mode == "translated"
+            and self._translated_hash is not None
+            and self._translated_hash != self._doc_hash()
+        )
+
+    def _build_translation(self) -> None:
+        """Produce the translated Markdown for the current document.
+
+        PR1 placeholder: echoes the source so the view and state machine can be
+        exercised offline. A later PR replaces this with translate.py (chunking,
+        per-paragraph caching and the DeepSeek client).
+        """
+        self._translated_md = self.editor.text
+        self._translated_hash = self._doc_hash()
+        self._notice = "译文预览（占位：DeepSeek 翻译将在后续接入）"
+
+    def _enter_translation_view(self) -> None:
+        # Reuse an up-to-date translation for an instant toggle.
+        if not (self._translated_md and self._translated_hash == self._doc_hash()):
+            self._build_translation()
+        self._preview_mode = "translated"
+        self._render_preview_soon(0.0)
+
+    def _exit_translation_view(self) -> None:
+        self._preview_mode = "original"
+        self._render_preview_soon(0.0)
+
+    def _refresh_translation(self) -> None:
+        if self._preview_mode != "translated":
+            self._notice = "E: 不在译文预览（先 :trans）"
+            return
+        self._build_translation()
+        self._render_preview_soon(0.0)
 
     # ------------------------------------------------------------------
     # Command line (: and /)
@@ -270,6 +347,15 @@ class EasyMDApp(App):
             self._notice = f'"{target}" written'
             if name in ("wq", "x"):
                 self.exit()
+        elif name == "trans":
+            if self._preview_mode == "translated":
+                self._exit_translation_view()
+            else:
+                self._enter_translation_view()
+        elif name in ("transback", "transorig"):
+            self._exit_translation_view()
+        elif name == "refresh":
+            self._refresh_translation()
         elif name in ("q", "q!", "qa", "qa!"):
             if name.endswith("!") or not self.modified:
                 self.exit()
