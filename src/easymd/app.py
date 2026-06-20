@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from pathlib import Path
 
 from rich.markup import escape
@@ -281,14 +282,52 @@ class EasyMDApp(App):
                 return y0 + (line - l0) / (l1 - l0) * (y1 - y0)
         return float(anchors[-1][1])
 
+    def _translated_scroll_y(self) -> float | None:
+        """Preview y aligning the editor's current section with the translation.
+
+        Both documents keep the same heading structure, so we map the heading
+        the editor's top line sits under to the same heading in the preview.
+        """
+        headings = parse_headings(self.editor.text)
+        if not headings:
+            return None
+        top = self._editor_top_line()
+        section = -1
+        for index, (_level, _title, line) in enumerate(headings):
+            if line <= top:
+                section = index
+            else:
+                break
+        if section < 0:
+            return 0.0
+        try:
+            md = self.query_one("#preview", Markdown)
+        except Exception:
+            return None
+        seen = -1
+        for block in md.children:
+            source = getattr(block, "source", "") or ""
+            if source.lstrip().startswith("#"):
+                seen += 1
+                if seen == section:
+                    return float(block.virtual_region.y)
+        return None
+
     def _sync_scroll(self) -> None:
-        # The translation view scrolls independently: its lines don't map to the
-        # editor's source lines, so only the original view stays in lockstep.
-        if self._preview_mode != "original":
+        # The summary view is condensed and has no line correspondence.
+        if self._preview_mode == "summary":
             return
         try:
             scroller = self.query_one("#preview-scroll", VerticalScroll)
         except Exception:
+            return
+        if self._preview_mode == "translated":
+            # The translation preserves headings, so align by section heading.
+            y = self._translated_scroll_y()
+            if y is not None:
+                scroller.scroll_to(
+                    y=max(0, min(y, scroller.max_scroll_y)), animate=False
+                )
             return
         y = self._preview_y_for_line(self._editor_top_line())
         if y is None:
@@ -430,13 +469,23 @@ class EasyMDApp(App):
             self._render_preview_soon(0.0)
             self._update_status()
 
+        last_render = 0.0
+
+        def on_delta(partial: str) -> None:
+            nonlocal last_render
+            self._set_ai(mode, partial, None)
+            now = time.monotonic()
+            if now - last_render > 0.1:  # throttle live token rendering
+                last_render = now
+                self._render_preview_soon(0.0)
+
         call = (
             self._translator.translate_document
             if mode == "translated"
             else self._translator.summarize_document
         )
         try:
-            await call(self.editor.text, on_chunk)
+            await call(self.editor.text, on_chunk, on_delta)
         except TranslateError as error:
             # Friendly fallback: revert to the original view, surface the reason.
             self._preview_mode = "original"

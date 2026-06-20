@@ -12,7 +12,10 @@ crashing the editor.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+from pathlib import Path
 from typing import Callable
 
 try:  # optional dependency: pip install easymd-cli[translate]
@@ -30,6 +33,17 @@ HEADING_RE = re.compile(r"^#{1,6}\s")
 
 # (translated_chunk, done_count, total_count)
 ProgressCallback = Callable[[str, int, int], None]
+# Accumulated text so far during streaming.
+DeltaCallback = Callable[[str], None]
+
+
+def _default_cache_dir() -> Path | None:
+    """Persistent cache location, or None if disabled (EASYMD_CACHE_DIR="")."""
+    override = os.environ.get("EASYMD_CACHE_DIR")
+    if override == "":
+        return None
+    base = override or os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    return Path(base).expanduser() / "easymd" / "translate"
 
 
 class TranslateError(RuntimeError):
@@ -73,9 +87,46 @@ def _chunk_key(chunk: str) -> str:
 class Translator:
     """Translate Markdown via DeepSeek, caching chunks by content hash."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, cache_dir: Path | None = ...) -> None:
         self.config = config
         self._cache: dict[str, str] = {}
+        self._cache_dir = _default_cache_dir() if cache_dir is ... else cache_dir
+
+    # --- two-level cache (memory + optional disk) ---------------------------
+
+    def _cache_get(self, key: str) -> str | None:
+        if key in self._cache:
+            return self._cache[key]
+        disk = self._disk_read(key)
+        if disk is not None:
+            self._cache[key] = disk
+        return disk
+
+    def _cache_set(self, key: str, value: str) -> None:
+        self._cache[key] = value
+        self._disk_write(key, value)
+
+    def _disk_path(self, key: str) -> Path | None:
+        return self._cache_dir / f"{key}.md" if self._cache_dir else None
+
+    def _disk_read(self, key: str) -> str | None:
+        path = self._disk_path(key)
+        if path is None or not path.is_file():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _disk_write(self, key: str, value: str) -> None:
+        path = self._disk_path(key)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="utf-8")
+        except OSError:
+            pass
 
     def _translate_system_prompt(self) -> str:
         lang = self.config.target_lang
@@ -99,13 +150,16 @@ class Translator:
         )
 
     async def translate_document(
-        self, text: str, on_chunk: ProgressCallback | None = None
+        self,
+        text: str,
+        on_chunk: ProgressCallback | None = None,
+        on_delta: DeltaCallback | None = None,
     ) -> str:
         """Translate the whole document, chunk by chunk.
 
-        Calls on_chunk(translated, done, total) after each chunk so the caller
-        can render progressively. Raises TranslateError if the feature is not
-        usable (missing extra or API key).
+        on_chunk(translated, done, total) fires after each chunk; on_delta gets
+        the full text-so-far as tokens stream in. Raises TranslateError if the
+        feature is unusable (missing extra or API key).
         """
         if httpx is None:
             raise TranslateError(EXTRAS_HINT)
@@ -114,16 +168,19 @@ class Translator:
 
         chunks = split_chunks(text)
         total = len(chunks)
-        out: list[str] = []
+        done: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
-            translated = await self._translate_chunk(chunk)
-            out.append(translated)
+            translated = await self._translate_chunk(chunk, done, on_delta)
+            done.append(translated)
             if on_chunk is not None:
                 on_chunk(translated, index, total)
-        return "\n\n".join(out)
+        return "\n\n".join(done)
 
     async def summarize_document(
-        self, text: str, on_chunk: ProgressCallback | None = None
+        self,
+        text: str,
+        on_chunk: ProgressCallback | None = None,
+        on_delta: DeltaCallback | None = None,
     ) -> str:
         """Summarize the whole document into a short TL;DR (cached by content)."""
         if httpx is None:
@@ -131,27 +188,50 @@ class Translator:
         if not self.config.has_key:
             raise TranslateError(NO_KEY_HINT)
         key = "sum:" + _chunk_key(text)
-        cached = self._cache.get(key)
+        cached = self._cache_get(key)
         if cached is None:
-            cached = await self._post(self._summary_system_prompt(), text)
-            self._cache[key] = cached
+            cached = await self._post(
+                self._summary_system_prompt(), text, on_delta=on_delta
+            )
+            self._cache_set(key, cached)
         if on_chunk is not None:
             on_chunk(cached, 1, 1)
         return cached
 
-    async def _translate_chunk(self, chunk: str) -> str:
+    async def _translate_chunk(
+        self,
+        chunk: str,
+        done: list[str] | None = None,
+        on_delta: DeltaCallback | None = None,
+    ) -> str:
         key = _chunk_key(chunk)
-        cached = self._cache.get(key)
+        cached = self._cache_get(key)
         if cached is not None:
             return cached
-        translated = await self._call_deepseek(chunk)
-        self._cache[key] = translated
+        delta_cb = None
+        if on_delta is not None:
+            prefix = done or []
+
+            def delta_cb(partial: str) -> None:
+                on_delta("\n\n".join([*prefix, partial]))
+
+        translated = await self._post(
+            self._translate_system_prompt(), chunk, on_delta=delta_cb
+        )
+        self._cache_set(key, translated)
         return translated
 
     async def _call_deepseek(self, chunk: str) -> str:
         return await self._post(self._translate_system_prompt(), chunk)
 
-    async def _post(self, system_prompt: str, user_text: str) -> str:
+    async def _post(
+        self,
+        system_prompt: str,
+        user_text: str,
+        on_delta: DeltaCallback | None = None,
+    ) -> str:
+        if on_delta is not None:
+            return await self._post_stream(system_prompt, user_text, on_delta)
         payload = {
             "model": self.config.model,
             "messages": [
@@ -185,3 +265,47 @@ class Translator:
                     break
         # A single failed call must not abort the whole document.
         return f"> [翻译失败] {last_error}\n\n{user_text}"
+
+    async def _post_stream(
+        self, system_prompt: str, user_text: str, on_delta: DeltaCallback
+    ) -> str:
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.0,
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.config.base_url}/chat/completions"
+        acc = ""
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST", url, json=payload, headers=headers
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode("utf-8", "replace")
+                        return f"> [翻译失败] HTTP {resp.status_code}: {body[:200]}"
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            delta = json.loads(data)["choices"][0]["delta"]
+                        except (KeyError, IndexError, ValueError):
+                            continue
+                        piece = delta.get("content") or ""
+                        if piece:
+                            acc += piece
+                            on_delta(acc)
+        except httpx.HTTPError as exc:
+            return acc.strip() or f"> [翻译失败] {exc}\n\n{user_text}"
+        return acc.strip() or f"> [翻译失败] empty response\n\n{user_text}"
