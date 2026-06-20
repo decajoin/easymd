@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 from rich.markup import escape
@@ -11,7 +12,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.geometry import Offset
 from textual.message import Message
-from textual.widgets import Input, Markdown, Static, TextArea
+from textual.widgets import Input, Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 from .config import Config, load_config
 from .editor import VimTextArea
@@ -46,6 +48,40 @@ class CommandLine(Input):
         await super()._on_key(event)
 
 
+class TocPanel(OptionList):
+    """Heading outline; escape closes it back to the editor."""
+
+    class Cancelled(Message):
+        pass
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Cancelled())
+            return
+        await super()._on_key(event)
+
+
+_HEADING_RE = re.compile(r"(#{1,6})\s+(.*)")
+
+
+def parse_headings(text: str) -> list[tuple[int, str, int]]:
+    """Return (level, title, line_index) for each heading outside code fences."""
+    out: list[tuple[int, str, int]] = []
+    in_fence = False
+    for i, line in enumerate(text.splitlines()):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _HEADING_RE.match(line)
+        if match:
+            out.append((len(match.group(1)), match.group(2).strip(), i))
+    return out
+
+
 class EasyMDApp(App):
     TITLE = "easymd"
 
@@ -57,6 +93,11 @@ class EasyMDApp(App):
         border-left: heavy $accent;
         padding: 0 1;
         scrollbar-size-vertical: 1;
+    }
+    #toc {
+        width: 30;
+        border-right: heavy $accent;
+        display: none;
     }
     #status { dock: bottom; height: 1; background: $panel; padding: 0 1; }
     #cmdline {
@@ -84,6 +125,7 @@ class EasyMDApp(App):
         self._preview_mode = "original"
         self._translated_md = ""
         self._translated_hash: str | None = None  # doc hash when translated
+        self._toc_lines: list[int] = []  # option index -> document line
 
     # ------------------------------------------------------------------
     # Layout
@@ -95,6 +137,7 @@ class EasyMDApp(App):
         except Exception:
             pass  # syntax highlighting is optional (needs textual[syntax])
         with Horizontal(id="main"):
+            yield TocPanel(id="toc")
             yield editor
             with VerticalScroll(id="preview-scroll"):
                 yield Markdown(self._saved_text, id="preview")
@@ -262,6 +305,45 @@ class EasyMDApp(App):
         scroller.scroll_to(y=max(0, min(target, preview_max)), animate=False)
 
     # ------------------------------------------------------------------
+    # Table of contents (:toc)
+
+    def _toggle_toc(self) -> None:
+        panel = self.query_one("#toc", TocPanel)
+        if panel.display:
+            self._hide_toc()
+        else:
+            self._show_toc()
+
+    def _show_toc(self) -> None:
+        panel = self.query_one("#toc", TocPanel)
+        panel.clear_options()
+        self._toc_lines = []
+        for level, title, line in parse_headings(self.editor.text):
+            panel.add_option(Option(f"{'  ' * (level - 1)}{escape(title)}"))
+            self._toc_lines.append(line)
+        if not self._toc_lines:
+            panel.add_option(Option("[dim]（无标题）[/]"))
+        panel.display = True
+        panel.focus()
+        if self._toc_lines:
+            panel.highlighted = 0
+
+    def _hide_toc(self) -> None:
+        self.query_one("#toc", TocPanel).display = False
+        self.editor.focus()
+
+    def on_toc_panel_cancelled(self, event: TocPanel.Cancelled) -> None:
+        self._hide_toc()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        index = event.option_index
+        if 0 <= index < len(self._toc_lines):
+            self.editor.move_cursor((self._toc_lines[index], 0))
+        self._hide_toc()
+
+    # ------------------------------------------------------------------
     # Translation preview
 
     def _doc_hash(self) -> str:
@@ -386,6 +468,8 @@ class EasyMDApp(App):
             self._refresh_translation()
         elif name in ("noh", "nohlsearch"):
             self.editor.clear_search()
+        elif name == "toc":
+            self._toggle_toc()
         elif name in ("q", "q!", "qa", "qa!"):
             if name.endswith("!") or not self.modified:
                 self.exit()
