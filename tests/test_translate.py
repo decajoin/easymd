@@ -131,3 +131,28 @@ async def test_missing_key_raises():
     tr = Translator(_cfg(api_key=None))
     with pytest.raises(TranslateError):
         await tr.translate_document("# A\n")
+
+
+# --- summary ----------------------------------------------------------------
+
+async def test_summarize_calls_post_once_and_caches(monkeypatch):
+    tr = Translator(_cfg())
+    calls = []
+
+    async def fake_post(system_prompt, user_text):
+        calls.append(system_prompt)
+        return "TL;DR result"
+
+    monkeypatch.setattr(tr, "_post", fake_post)
+    out1 = await tr.summarize_document("# Doc\n\nbody\n")
+    out2 = await tr.summarize_document("# Doc\n\nbody\n")  # cached
+    assert out1 == out2 == "TL;DR result"
+    assert len(calls) == 1  # second call served from cache
+    assert "Summarize" in calls[0] or "summary" in calls[0].lower()
+
+
+async def test_summarize_missing_extras_raises(monkeypatch):
+    monkeypatch.setattr(translate, "httpx", None)
+    tr = Translator(_cfg())
+    with pytest.raises(TranslateError):
+        await tr.summarize_document("# A\n")

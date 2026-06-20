@@ -77,7 +77,7 @@ class Translator:
         self.config = config
         self._cache: dict[str, str] = {}
 
-    def _system_prompt(self) -> str:
+    def _translate_system_prompt(self) -> str:
         lang = self.config.target_lang
         return (
             f"You are a Markdown translator. Translate the user's Markdown into "
@@ -86,6 +86,16 @@ class Translator:
             "links, images, tables, lists and emphasis. Do not add explanations "
             "and do not wrap the result in code fences. Output only the "
             "translated Markdown."
+        )
+
+    def _summary_system_prompt(self) -> str:
+        lang = self.config.target_lang
+        return (
+            f"You are a technical writer. Summarize the user's Markdown document "
+            f"into a concise TL;DR written in {lang}. Produce a short Markdown "
+            "summary — 3 to 6 bullet points, or a brief paragraph — capturing the "
+            "key points and far shorter than the source. Output only the Markdown "
+            "summary, with no preamble."
         )
 
     async def translate_document(
@@ -112,6 +122,23 @@ class Translator:
                 on_chunk(translated, index, total)
         return "\n\n".join(out)
 
+    async def summarize_document(
+        self, text: str, on_chunk: ProgressCallback | None = None
+    ) -> str:
+        """Summarize the whole document into a short TL;DR (cached by content)."""
+        if httpx is None:
+            raise TranslateError(EXTRAS_HINT)
+        if not self.config.has_key:
+            raise TranslateError(NO_KEY_HINT)
+        key = "sum:" + _chunk_key(text)
+        cached = self._cache.get(key)
+        if cached is None:
+            cached = await self._post(self._summary_system_prompt(), text)
+            self._cache[key] = cached
+        if on_chunk is not None:
+            on_chunk(cached, 1, 1)
+        return cached
+
     async def _translate_chunk(self, chunk: str) -> str:
         key = _chunk_key(chunk)
         cached = self._cache.get(key)
@@ -122,11 +149,14 @@ class Translator:
         return translated
 
     async def _call_deepseek(self, chunk: str) -> str:
+        return await self._post(self._translate_system_prompt(), chunk)
+
+    async def _post(self, system_prompt: str, user_text: str) -> str:
         payload = {
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": chunk},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
             ],
             "temperature": 0.0,
             "stream": False,
@@ -153,5 +183,5 @@ class Translator:
                 except (KeyError, IndexError, ValueError) as exc:
                     last_error = f"bad response: {exc}"
                     break
-        # A single chunk failing must not abort the whole document.
-        return f"> [翻译失败] {last_error}\n\n{chunk}"
+        # A single failed call must not abort the whole document.
+        return f"> [翻译失败] {last_error}\n\n{user_text}"

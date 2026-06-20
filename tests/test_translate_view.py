@@ -21,6 +21,13 @@ class FakeTranslator:
             on_chunk(result, 1, 1)
         return result
 
+    async def summarize_document(self, text, on_chunk=None):
+        self.calls += 1
+        result = "TL;DR: " + text.split("\n", 1)[0]
+        if on_chunk is not None:
+            on_chunk(result, 1, 1)
+        return result
+
 
 async def _command(pilot, name: str) -> None:
     await pilot.press("colon")

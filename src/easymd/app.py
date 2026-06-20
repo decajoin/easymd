@@ -122,9 +122,11 @@ class EasyMDApp(App):
         self._translator = Translator(self._config)
         # Preview window state: "original" shows editor.text, "translated"
         # shows the cached translation (untouched by edits until :refresh).
-        self._preview_mode = "original"
+        self._preview_mode = "original"  # "original" | "translated" | "summary"
         self._translated_md = ""
         self._translated_hash: str | None = None  # doc hash when translated
+        self._summary_md = ""
+        self._summary_hash: str | None = None  # doc hash when summarized
         self._toc_lines: list[int] = []  # option index -> document line
 
     # ------------------------------------------------------------------
@@ -175,11 +177,12 @@ class EasyMDApp(App):
         row, col = ed.cursor_location
         flag = " ●" if self.modified else ""
         preview_flag = ""
-        if self._preview_mode == "translated":
+        if self._preview_mode in self._AI:
+            label = self._AI[self._preview_mode][0]
             preview_flag = (
-                " [yellow]译文·已过期 :refresh[/]"
-                if self._translation_stale()
-                else " [cyan]译文[/]"
+                f" [yellow]{label}·已过期 :refresh[/]"
+                if self._view_stale()
+                else f" [cyan]{label}[/]"
             )
         search_flag = ""
         if ed._search and ed._search_total:
@@ -224,11 +227,12 @@ class EasyMDApp(App):
         self._preview_timer = self.set_timer(max(delay, 0.01), self._refresh_preview)
 
     async def _refresh_preview(self) -> None:
-        content = (
-            self._translated_md
-            if self._preview_mode == "translated"
-            else self.editor.text
-        )
+        if self._preview_mode == "translated":
+            content = self._translated_md
+        elif self._preview_mode == "summary":
+            content = self._summary_md
+        else:
+            content = self.editor.text
         await self.query_one("#preview", Markdown).update(content)
         # Re-sync once the new blocks have been laid out and measured.
         self.call_after_refresh(self._sync_scroll)
@@ -344,67 +348,105 @@ class EasyMDApp(App):
         self._hide_toc()
 
     # ------------------------------------------------------------------
-    # Translation preview
+    # AI preview: translation (:trans) and summary (:summarize)
+    #
+    # Both swap the right pane for AI-generated Markdown, cached by document
+    # hash, produced in a worker and reverting to the original view on error.
+
+    _AI = {
+        "translated": ("译文", "翻译中…", "译文已更新"),
+        "summary": ("摘要", "生成摘要中…", "摘要已更新"),
+    }
 
     def _doc_hash(self) -> str:
         return hashlib.sha256(self.editor.text.encode("utf-8")).hexdigest()
 
-    def _translation_stale(self) -> bool:
-        return (
-            self._preview_mode == "translated"
-            and self._translated_hash is not None
-            and self._translated_hash != self._doc_hash()
-        )
+    def _ai_md(self, mode: str) -> str:
+        return self._translated_md if mode == "translated" else self._summary_md
 
-    def _enter_translation_view(self) -> None:
-        self._preview_mode = "translated"
-        # An up-to-date cached translation switches in instantly; otherwise
-        # show a placeholder and translate in the background.
-        if self._translated_md and self._translated_hash == self._doc_hash():
+    def _ai_hash(self, mode: str) -> str | None:
+        return self._translated_hash if mode == "translated" else self._summary_hash
+
+    def _set_ai(self, mode: str, md: str, hash_: str | None) -> None:
+        if mode == "translated":
+            self._translated_md, self._translated_hash = md, hash_
+        else:
+            self._summary_md, self._summary_hash = md, hash_
+
+    def _view_stale(self) -> bool:
+        mode = self._preview_mode
+        if mode not in self._AI:
+            return False
+        h = self._ai_hash(mode)
+        return h is not None and h != self._doc_hash()
+
+    def _translation_stale(self) -> bool:  # back-compat for callers/tests
+        return self._preview_mode == "translated" and self._view_stale()
+
+    def _toggle_ai_view(self, mode: str) -> None:
+        if self._preview_mode == mode:
+            self._exit_translation_view()
+            return
+        self._preview_mode = mode
+        # An up-to-date cached result switches in instantly; otherwise show a
+        # placeholder and generate in the background.
+        if self._ai_md(mode) and self._ai_hash(mode) == self._doc_hash():
             self._render_preview_soon(0.0)
         else:
-            self._start_translation()
+            self._start_ai(mode)
+
+    # Named wrappers keep the command table and existing tests readable.
+    def _enter_translation_view(self) -> None:
+        self._toggle_ai_view("translated")
+
+    def _enter_summary_view(self) -> None:
+        self._toggle_ai_view("summary")
 
     def _exit_translation_view(self) -> None:
         self._preview_mode = "original"
         self._render_preview_soon(0.0)
 
     def _refresh_translation(self) -> None:
-        if self._preview_mode != "translated":
-            self._notice = "E: 不在译文预览（先 :trans）"
+        if self._preview_mode not in self._AI:
+            self._notice = "E: 不在译文/摘要预览（先 :trans 或 :summarize）"
             return
-        self._start_translation()
+        self._start_ai(self._preview_mode)
 
-    def _start_translation(self) -> None:
-        self._translated_md = "> 翻译中…"
+    def _start_ai(self, mode: str) -> None:
+        self._set_ai(mode, f"> {self._AI[mode][1]}", None)
         self._render_preview_soon(0.0)
-        self._translate_worker()
+        self._ai_worker(mode)
 
-    @work(exclusive=True, group="translate")
-    async def _translate_worker(self) -> None:
+    @work(exclusive=True, group="ai")
+    async def _ai_worker(self, mode: str) -> None:
         source_hash = self._doc_hash()
+        label, progress, done_msg = self._AI[mode]
         parts: list[str] = []
 
-        def on_chunk(translated: str, done: int, total: int) -> None:
-            parts.append(translated)
-            self._translated_md = "\n\n".join(parts)
-            self._notice = f"翻译中… {done}/{total}"
+        def on_chunk(text: str, done: int, total: int) -> None:
+            parts.append(text)
+            self._set_ai(mode, "\n\n".join(parts), None)
+            self._notice = f"{label}中… {done}/{total}"
             self._render_preview_soon(0.0)
             self._update_status()
 
+        call = (
+            self._translator.translate_document
+            if mode == "translated"
+            else self._translator.summarize_document
+        )
         try:
-            await self._translator.translate_document(self.editor.text, on_chunk)
+            await call(self.editor.text, on_chunk)
         except TranslateError as error:
             # Friendly fallback: revert to the original view, surface the reason.
             self._preview_mode = "original"
-            self._translated_md = ""
-            self._translated_hash = None
+            self._set_ai(mode, "", None)
             self._notice = str(error)
             self._render_preview_soon(0.0)
             self._update_status()
             return
-        self._translated_hash = source_hash
-        self._notice = "译文已更新"
+        self._set_ai(mode, "\n\n".join(parts), source_hash)
+        self._notice = done_msg
         self._render_preview_soon(0.0)
         self._update_status()
 
@@ -462,6 +504,8 @@ class EasyMDApp(App):
                 self._exit_translation_view()
             else:
                 self._enter_translation_view()
+        elif name in ("summarize", "sum"):
+            self._enter_summary_view()
         elif name in ("transback", "transorig"):
             self._exit_translation_view()
         elif name == "refresh":
