@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import time
 from pathlib import Path
 
 from rich.markup import escape
@@ -11,7 +13,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.geometry import Offset
 from textual.message import Message
-from textual.widgets import Input, Markdown, Static, TextArea
+from textual.widgets import Input, Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 from .config import Config, load_config
 from .editor import VimTextArea
@@ -46,6 +49,40 @@ class CommandLine(Input):
         await super()._on_key(event)
 
 
+class TocPanel(OptionList):
+    """Heading outline; escape closes it back to the editor."""
+
+    class Cancelled(Message):
+        pass
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Cancelled())
+            return
+        await super()._on_key(event)
+
+
+_HEADING_RE = re.compile(r"(#{1,6})\s+(.*)")
+
+
+def parse_headings(text: str) -> list[tuple[int, str, int]]:
+    """Return (level, title, line_index) for each heading outside code fences."""
+    out: list[tuple[int, str, int]] = []
+    in_fence = False
+    for i, line in enumerate(text.splitlines()):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _HEADING_RE.match(line)
+        if match:
+            out.append((len(match.group(1)), match.group(2).strip(), i))
+    return out
+
+
 class EasyMDApp(App):
     TITLE = "easymd"
 
@@ -57,6 +94,11 @@ class EasyMDApp(App):
         border-left: heavy $accent;
         padding: 0 1;
         scrollbar-size-vertical: 1;
+    }
+    #toc {
+        width: 30;
+        border-right: heavy $accent;
+        display: none;
     }
     #status { dock: bottom; height: 1; background: $panel; padding: 0 1; }
     #cmdline {
@@ -81,9 +123,12 @@ class EasyMDApp(App):
         self._translator = Translator(self._config)
         # Preview window state: "original" shows editor.text, "translated"
         # shows the cached translation (untouched by edits until :refresh).
-        self._preview_mode = "original"
+        self._preview_mode = "original"  # "original" | "translated" | "summary"
         self._translated_md = ""
         self._translated_hash: str | None = None  # doc hash when translated
+        self._summary_md = ""
+        self._summary_hash: str | None = None  # doc hash when summarized
+        self._toc_lines: list[int] = []  # option index -> document line
 
     # ------------------------------------------------------------------
     # Layout
@@ -95,6 +140,7 @@ class EasyMDApp(App):
         except Exception:
             pass  # syntax highlighting is optional (needs textual[syntax])
         with Horizontal(id="main"):
+            yield TocPanel(id="toc")
             yield editor
             with VerticalScroll(id="preview-scroll"):
                 yield Markdown(self._saved_text, id="preview")
@@ -132,16 +178,23 @@ class EasyMDApp(App):
         row, col = ed.cursor_location
         flag = " ●" if self.modified else ""
         preview_flag = ""
-        if self._preview_mode == "translated":
+        if self._preview_mode in self._AI:
+            label = self._AI[self._preview_mode][0]
             preview_flag = (
-                " [yellow]译文·已过期 :refresh[/]"
-                if self._translation_stale()
-                else " [cyan]译文[/]"
+                f" [yellow]{label}·已过期 :refresh[/]"
+                if self._view_stale()
+                else f" [cyan]{label}[/]"
+            )
+        search_flag = ""
+        if ed._search and ed._search_total:
+            search_flag = (
+                f" [dim]/{escape(ed._search)} "
+                f"{ed._search_index}/{ed._search_total}[/]"
             )
         notice = f"  {escape(self._notice)}" if self._notice else ""
         status.update(
             f"[bold white on {color}] {label} [/] "
-            f"{escape(self.path.name)}{flag}{preview_flag}{notice}"
+            f"{escape(self.path.name)}{flag}{preview_flag}{search_flag}{notice}"
             f"[dim]  {row + 1}:{col + 1}[/]"
         )
 
@@ -175,11 +228,12 @@ class EasyMDApp(App):
         self._preview_timer = self.set_timer(max(delay, 0.01), self._refresh_preview)
 
     async def _refresh_preview(self) -> None:
-        content = (
-            self._translated_md
-            if self._preview_mode == "translated"
-            else self.editor.text
-        )
+        if self._preview_mode == "translated":
+            content = self._translated_md
+        elif self._preview_mode == "summary":
+            content = self._summary_md
+        else:
+            content = self.editor.text
         await self.query_one("#preview", Markdown).update(content)
         # Re-sync once the new blocks have been laid out and measured.
         self.call_after_refresh(self._sync_scroll)
@@ -228,14 +282,52 @@ class EasyMDApp(App):
                 return y0 + (line - l0) / (l1 - l0) * (y1 - y0)
         return float(anchors[-1][1])
 
+    def _translated_scroll_y(self) -> float | None:
+        """Preview y aligning the editor's current section with the translation.
+
+        Both documents keep the same heading structure, so we map the heading
+        the editor's top line sits under to the same heading in the preview.
+        """
+        headings = parse_headings(self.editor.text)
+        if not headings:
+            return None
+        top = self._editor_top_line()
+        section = -1
+        for index, (_level, _title, line) in enumerate(headings):
+            if line <= top:
+                section = index
+            else:
+                break
+        if section < 0:
+            return 0.0
+        try:
+            md = self.query_one("#preview", Markdown)
+        except Exception:
+            return None
+        seen = -1
+        for block in md.children:
+            source = getattr(block, "source", "") or ""
+            if source.lstrip().startswith("#"):
+                seen += 1
+                if seen == section:
+                    return float(block.virtual_region.y)
+        return None
+
     def _sync_scroll(self) -> None:
-        # The translation view scrolls independently: its lines don't map to the
-        # editor's source lines, so only the original view stays in lockstep.
-        if self._preview_mode != "original":
+        # The summary view is condensed and has no line correspondence.
+        if self._preview_mode == "summary":
             return
         try:
             scroller = self.query_one("#preview-scroll", VerticalScroll)
         except Exception:
+            return
+        if self._preview_mode == "translated":
+            # The translation preserves headings, so align by section heading.
+            y = self._translated_scroll_y()
+            if y is not None:
+                scroller.scroll_to(
+                    y=max(0, min(y, scroller.max_scroll_y)), animate=False
+                )
             return
         y = self._preview_y_for_line(self._editor_top_line())
         if y is None:
@@ -256,67 +348,154 @@ class EasyMDApp(App):
         scroller.scroll_to(y=max(0, min(target, preview_max)), animate=False)
 
     # ------------------------------------------------------------------
-    # Translation preview
+    # Table of contents (:toc)
+
+    def _toggle_toc(self) -> None:
+        panel = self.query_one("#toc", TocPanel)
+        if panel.display:
+            self._hide_toc()
+        else:
+            self._show_toc()
+
+    def _show_toc(self) -> None:
+        panel = self.query_one("#toc", TocPanel)
+        panel.clear_options()
+        self._toc_lines = []
+        for level, title, line in parse_headings(self.editor.text):
+            panel.add_option(Option(f"{'  ' * (level - 1)}{escape(title)}"))
+            self._toc_lines.append(line)
+        if not self._toc_lines:
+            panel.add_option(Option("[dim]（无标题）[/]"))
+        panel.display = True
+        panel.focus()
+        if self._toc_lines:
+            panel.highlighted = 0
+
+    def _hide_toc(self) -> None:
+        self.query_one("#toc", TocPanel).display = False
+        self.editor.focus()
+
+    def on_toc_panel_cancelled(self, event: TocPanel.Cancelled) -> None:
+        self._hide_toc()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        index = event.option_index
+        if 0 <= index < len(self._toc_lines):
+            self.editor.move_cursor((self._toc_lines[index], 0))
+        self._hide_toc()
+
+    # ------------------------------------------------------------------
+    # AI preview: translation (:trans) and summary (:summarize)
+    #
+    # Both swap the right pane for AI-generated Markdown, cached by document
+    # hash, produced in a worker and reverting to the original view on error.
+
+    _AI = {
+        "translated": ("译文", "翻译中…", "译文已更新"),
+        "summary": ("摘要", "生成摘要中…", "摘要已更新"),
+    }
 
     def _doc_hash(self) -> str:
         return hashlib.sha256(self.editor.text.encode("utf-8")).hexdigest()
 
-    def _translation_stale(self) -> bool:
-        return (
-            self._preview_mode == "translated"
-            and self._translated_hash is not None
-            and self._translated_hash != self._doc_hash()
-        )
+    def _ai_md(self, mode: str) -> str:
+        return self._translated_md if mode == "translated" else self._summary_md
 
-    def _enter_translation_view(self) -> None:
-        self._preview_mode = "translated"
-        # An up-to-date cached translation switches in instantly; otherwise
-        # show a placeholder and translate in the background.
-        if self._translated_md and self._translated_hash == self._doc_hash():
+    def _ai_hash(self, mode: str) -> str | None:
+        return self._translated_hash if mode == "translated" else self._summary_hash
+
+    def _set_ai(self, mode: str, md: str, hash_: str | None) -> None:
+        if mode == "translated":
+            self._translated_md, self._translated_hash = md, hash_
+        else:
+            self._summary_md, self._summary_hash = md, hash_
+
+    def _view_stale(self) -> bool:
+        mode = self._preview_mode
+        if mode not in self._AI:
+            return False
+        h = self._ai_hash(mode)
+        return h is not None and h != self._doc_hash()
+
+    def _translation_stale(self) -> bool:  # back-compat for callers/tests
+        return self._preview_mode == "translated" and self._view_stale()
+
+    def _toggle_ai_view(self, mode: str) -> None:
+        if self._preview_mode == mode:
+            self._exit_translation_view()
+            return
+        self._preview_mode = mode
+        # An up-to-date cached result switches in instantly; otherwise show a
+        # placeholder and generate in the background.
+        if self._ai_md(mode) and self._ai_hash(mode) == self._doc_hash():
             self._render_preview_soon(0.0)
         else:
-            self._start_translation()
+            self._start_ai(mode)
+
+    # Named wrappers keep the command table and existing tests readable.
+    def _enter_translation_view(self) -> None:
+        self._toggle_ai_view("translated")
+
+    def _enter_summary_view(self) -> None:
+        self._toggle_ai_view("summary")
 
     def _exit_translation_view(self) -> None:
         self._preview_mode = "original"
         self._render_preview_soon(0.0)
 
     def _refresh_translation(self) -> None:
-        if self._preview_mode != "translated":
-            self._notice = "E: 不在译文预览（先 :trans）"
+        if self._preview_mode not in self._AI:
+            self._notice = "E: 不在译文/摘要预览（先 :trans 或 :summarize）"
             return
-        self._start_translation()
+        self._start_ai(self._preview_mode)
 
-    def _start_translation(self) -> None:
-        self._translated_md = "> 翻译中…"
+    def _start_ai(self, mode: str) -> None:
+        self._set_ai(mode, f"> {self._AI[mode][1]}", None)
         self._render_preview_soon(0.0)
-        self._translate_worker()
+        self._ai_worker(mode)
 
-    @work(exclusive=True, group="translate")
-    async def _translate_worker(self) -> None:
+    @work(exclusive=True, group="ai")
+    async def _ai_worker(self, mode: str) -> None:
         source_hash = self._doc_hash()
+        label, progress, done_msg = self._AI[mode]
         parts: list[str] = []
 
-        def on_chunk(translated: str, done: int, total: int) -> None:
-            parts.append(translated)
-            self._translated_md = "\n\n".join(parts)
-            self._notice = f"翻译中… {done}/{total}"
+        def on_chunk(text: str, done: int, total: int) -> None:
+            parts.append(text)
+            self._set_ai(mode, "\n\n".join(parts), None)
+            self._notice = f"{label}中… {done}/{total}"
             self._render_preview_soon(0.0)
             self._update_status()
 
+        last_render = 0.0
+
+        def on_delta(partial: str) -> None:
+            nonlocal last_render
+            self._set_ai(mode, partial, None)
+            now = time.monotonic()
+            if now - last_render > 0.1:  # throttle live token rendering
+                last_render = now
+                self._render_preview_soon(0.0)
+
+        call = (
+            self._translator.translate_document
+            if mode == "translated"
+            else self._translator.summarize_document
+        )
         try:
-            await self._translator.translate_document(self.editor.text, on_chunk)
+            await call(self.editor.text, on_chunk, on_delta)
         except TranslateError as error:
             # Friendly fallback: revert to the original view, surface the reason.
             self._preview_mode = "original"
-            self._translated_md = ""
-            self._translated_hash = None
+            self._set_ai(mode, "", None)
             self._notice = str(error)
             self._render_preview_soon(0.0)
             self._update_status()
             return
-        self._translated_hash = source_hash
-        self._notice = "译文已更新"
+        self._set_ai(mode, "\n\n".join(parts), source_hash)
+        self._notice = done_msg
         self._render_preview_soon(0.0)
         self._update_status()
 
@@ -374,10 +553,16 @@ class EasyMDApp(App):
                 self._exit_translation_view()
             else:
                 self._enter_translation_view()
+        elif name in ("summarize", "sum"):
+            self._enter_summary_view()
         elif name in ("transback", "transorig"):
             self._exit_translation_view()
         elif name == "refresh":
             self._refresh_translation()
+        elif name in ("noh", "nohlsearch"):
+            self.editor.clear_search()
+        elif name == "toc":
+            self._toggle_toc()
         elif name in ("q", "q!", "qa", "qa!"):
             if name.endswith("!") or not self.modified:
                 self.exit()

@@ -72,8 +72,11 @@ uv run pytest            # 运行测试
 | `:q` `:q!` `:wq` `:x` | 退出（有未保存修改时 `:q` 会拒绝） |
 | `/文本` 然后 `n` / `N` | 搜索 / 下一个 / 上一个 |
 | `:trans` | 切换右侧预览为译文 / 原文（见「翻译预览」） |
+| `:summarize`（`:sum`） | 把右侧预览换成全文摘要（TL;DR，目标语言同翻译） |
 | `:transback` | 切回原文预览 |
-| `:refresh` | 重新翻译（编辑后更新译文，只重翻改动段） |
+| `:refresh` | 重新生成当前 AI 预览（译文/摘要，只重做改动部分） |
+| `:toc` | 开/关左侧标题大纲，回车跳到标题 |
+| `:noh` | 清除搜索高亮 |
 
 ## 翻译预览（DeepSeek）
 
@@ -105,7 +108,14 @@ target_lang = "中文"
 `easymd config set-model deepseek-v4-pro`。也可在启动时覆盖：
 `easymd --pro 笔记.md`、`easymd --model <id> 笔记.md`、`easymd --lang English 笔记.md`。
 
-未装 `[translate]` 依赖或未配置 key 时，`:trans` 会在状态栏给出友好提示而不会崩溃。
+`:summarize`（别名 `:sum`）复用同一套机制,把整篇生成一段简短 TL;DR 显示在预览窗,
+目标语言和翻译一致(默认中文)。`:refresh` 会重做当前激活的 AI 预览(译文或摘要)。
+
+译文逐 token 流式刷新,体感更快;结果按段落落盘缓存到 `~/.cache/easymd/translate/`,
+重复翻译同一内容不再花钱(设 `EASYMD_CACHE_DIR=` 为空可禁用,或指向别处)。译文模式下
+预览按标题分节与左侧编辑器联动滚动;摘要是浓缩内容,不做滚动联动。
+
+未装 `[translate]` 依赖或未配置 key 时，`:trans` / `:summarize` 会在状态栏给出友好提示而不会崩溃。
 
 ## 项目结构
 

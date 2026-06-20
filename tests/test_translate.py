@@ -49,14 +49,14 @@ def test_blank_document_yields_no_chunks():
 # --- caching ----------------------------------------------------------------
 
 async def test_identical_chunks_hit_cache(monkeypatch):
-    tr = Translator(_cfg())
+    tr = Translator(_cfg(), cache_dir=None)
     calls = []
 
-    async def fake_call(chunk):
-        calls.append(chunk)
-        return "T:" + chunk
+    async def fake_post(system_prompt, user_text, on_delta=None):
+        calls.append(user_text)
+        return "T:" + user_text
 
-    monkeypatch.setattr(tr, "_call_deepseek", fake_call)
+    monkeypatch.setattr(tr, "_post", fake_post)
     out = await tr.translate_document("# A\n\nx\n\n# A\n\nx\n")
     assert calls == ["# A\n\nx"]  # second identical chunk served from cache
     assert out.count("T:# A\n\nx") == 2
@@ -131,3 +131,105 @@ async def test_missing_key_raises():
     tr = Translator(_cfg(api_key=None))
     with pytest.raises(TranslateError):
         await tr.translate_document("# A\n")
+
+
+# --- summary ----------------------------------------------------------------
+
+async def test_summarize_calls_post_once_and_caches(monkeypatch):
+    tr = Translator(_cfg(), cache_dir=None)
+    calls = []
+
+    async def fake_post(system_prompt, user_text, on_delta=None):
+        calls.append(system_prompt)
+        return "TL;DR result"
+
+    monkeypatch.setattr(tr, "_post", fake_post)
+    out1 = await tr.summarize_document("# Doc\n\nbody\n")
+    out2 = await tr.summarize_document("# Doc\n\nbody\n")  # cached
+    assert out1 == out2 == "TL;DR result"
+    assert len(calls) == 1  # second call served from cache
+    assert "Summarize" in calls[0] or "summary" in calls[0].lower()
+
+
+async def test_summarize_missing_extras_raises(monkeypatch):
+    monkeypatch.setattr(translate, "httpx", None)
+    tr = Translator(_cfg())
+    with pytest.raises(TranslateError):
+        await tr.summarize_document("# A\n")
+
+
+# --- streaming and disk cache (feature 4) -----------------------------------
+
+class _FakeStream:
+    def __init__(self, lines, status=200):
+        self._lines = lines
+        self.status_code = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aread(self):
+        return b"error body"
+
+
+class _StreamClient:
+    def __init__(self, stream):
+        self._stream = stream
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, method, url, json=None, headers=None):
+        return self._stream
+
+
+async def test_post_stream_accumulates_deltas(monkeypatch):
+    tr = Translator(_cfg(), cache_dir=None)
+    sse = [
+        'data: {"choices":[{"delta":{"content":"你好"}}]}',
+        'data: {"choices":[{"delta":{"content":"世界"}}]}',
+        "data: [DONE]",
+    ]
+    monkeypatch.setattr(
+        translate.httpx, "AsyncClient", lambda *a, **k: _StreamClient(_FakeStream(sse))
+    )
+    seen = []
+    out = await tr._post_stream("sys", "hi", on_delta=seen.append)
+    assert out == "你好世界"
+    assert seen == ["你好", "你好世界"]  # progressive accumulation
+
+
+async def test_disk_cache_persists_across_instances(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_post(system_prompt, user_text, on_delta=None):
+        calls.append(user_text)
+        return "DISK:" + user_text
+
+    tr1 = Translator(_cfg(), cache_dir=tmp_path)
+    monkeypatch.setattr(tr1, "_post", fake_post)
+    await tr1.translate_document("# A\n\nbody\n")
+    assert len(calls) == 1
+
+    # A fresh translator (cold memory) must read the chunk from disk.
+    tr2 = Translator(_cfg(), cache_dir=tmp_path)
+    monkeypatch.setattr(tr2, "_post", fake_post)
+    out = await tr2.translate_document("# A\n\nbody\n")
+    assert len(calls) == 1  # no new network call
+    assert "DISK:" in out
+
+
+def test_cache_disabled_when_dir_empty(monkeypatch):
+    monkeypatch.setenv("EASYMD_CACHE_DIR", "")
+    tr = Translator(_cfg())
+    assert tr._cache_dir is None

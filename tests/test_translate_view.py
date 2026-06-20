@@ -14,9 +14,18 @@ class FakeTranslator:
         self.prefix = prefix
         self.calls = 0
 
-    async def translate_document(self, text, on_chunk=None):
+    async def translate_document(self, text, on_chunk=None, on_delta=None):
         self.calls += 1
         result = self.prefix + text
+        if on_delta is not None:
+            on_delta(result)
+        if on_chunk is not None:
+            on_chunk(result, 1, 1)
+        return result
+
+    async def summarize_document(self, text, on_chunk=None, on_delta=None):
+        self.calls += 1
+        result = "TL;DR: " + text.split("\n", 1)[0]
         if on_chunk is not None:
             on_chunk(result, 1, 1)
         return result
@@ -123,6 +132,25 @@ async def test_scroll_sync_disabled_in_translation(make_app):
         app.editor.move_cursor((38, 0))  # scrolls the editor
         await pilot.pause(0.3)
         assert scroller.scroll_offset.y == before  # preview did not follow
+
+
+async def test_translated_scroll_aligns_by_heading(make_app):
+    text = ""
+    for i in range(8):
+        body = "\n".join(f"line {i}-{j}" for j in range(6))
+        text += f"# Section {i}\n\n{body}\n\n"
+    app = make_app(text)
+    async with app.run_test(size=SIZE) as pilot:
+        app._translator = FakeTranslator(prefix="")  # echo: same heading layout
+        await _command(pilot, "trans")
+        await pilot.pause(0.2)
+        scroller = app.query_one("#preview-scroll", VerticalScroll)
+        before = scroller.scroll_offset.y  # aligned to Section 0 (near top)
+        target_line = text.splitlines().index("# Section 6")
+        app.editor.move_cursor((target_line, 0))
+        await pilot.pause(0.3)
+        # The translation preview follows by heading section, not stuck at top.
+        assert scroller.scroll_offset.y > before
 
 
 async def test_preview_shows_translation_markdown(make_app):
