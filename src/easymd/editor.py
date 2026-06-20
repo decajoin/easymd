@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from rich.style import Style
 from textual import events
 from textual.message import Message
 from textual.widgets import TextArea
@@ -43,6 +44,8 @@ class VimTextArea(TextArea):
         self._register: tuple[str, bool] = ("", False)  # (text, linewise)
         self._search = ""
         self._search_whole = False  # whole-word match (set by * and #)
+        self._search_total = 0  # match count, for the status bar
+        self._search_index = 0  # 1-based position of the current match
         self._line_anchor = 0  # anchor row for visual line mode
         # Chars overwritten in the current R session, for backspace-restore:
         # (location, original char) or (location, None) when appended.
@@ -1111,6 +1114,7 @@ class VimTextArea(TextArea):
             return
         matches = self._search_matches()
         if not matches:
+            self._refresh_search_highlights()
             return
         here = self.cursor_location
         if reverse:
@@ -1120,6 +1124,64 @@ class VimTextArea(TextArea):
             after = [m for m in matches if m > here]
             target = after[0] if after else matches[0]
         self.move_cursor(target)
+        self._refresh_search_highlights()
+
+    def clear_search(self) -> None:
+        self._search = ""
+        self._refresh_search_highlights()
+
+    # ------------------------------------------------------------------
+    # Search highlighting (overlaid on the syntax highlight map)
+
+    def _build_highlight_map(self) -> None:
+        # Tree-sitter rebuilds (and clears) _highlights on every edit; re-add
+        # the search highlights afterwards so they survive editing.
+        super()._build_highlight_map()
+        self._apply_search_highlights()
+
+    def _refresh_search_highlights(self) -> None:
+        self._build_highlight_map()
+        self.refresh()
+
+    def _ensure_search_styles(self) -> None:
+        try:
+            styles = self._theme.syntax_styles
+        except AttributeError:
+            return
+        styles.setdefault("search", Style(bgcolor="yellow", color="black"))
+        styles.setdefault(
+            "search_current", Style(bgcolor="dark_orange", color="black", bold=True)
+        )
+
+    def _apply_search_highlights(self) -> None:
+        # May run during TextArea.__init__ (before our attributes exist).
+        if not getattr(self, "_search", ""):
+            self._search_total = 0
+            self._search_index = 0
+            return
+        self._ensure_search_styles()
+        pat = self._search
+        plen = len(pat)
+        cursor = self.cursor_location
+        total = 0
+        index = 0
+        for row in range(self.document.line_count):
+            line = self.document.get_line(row)
+            i = line.find(pat)
+            while i >= 0:
+                if not self._search_whole or self._is_whole_word(line, i, plen):
+                    total += 1
+                    current = (row, i) == cursor
+                    if current:
+                        index = total
+                    # _highlights stores byte offsets within the line.
+                    byte_start = len(line[:i].encode("utf-8"))
+                    byte_end = len(line[: i + plen].encode("utf-8"))
+                    name = "search_current" if current else "search"
+                    self._highlights[row].append((byte_start, byte_end, name))
+                i = line.find(pat, i + 1)
+        self._search_total = total
+        self._search_index = index
 
     def _search_matches(self) -> list[tuple[int, int]]:
         pat = self._search

@@ -138,10 +138,16 @@ class EasyMDApp(App):
                 if self._translation_stale()
                 else " [cyan]译文[/]"
             )
+        search_flag = ""
+        if ed._search and ed._search_total:
+            search_flag = (
+                f" [dim]/{escape(ed._search)} "
+                f"{ed._search_index}/{ed._search_total}[/]"
+            )
         notice = f"  {escape(self._notice)}" if self._notice else ""
         status.update(
             f"[bold white on {color}] {label} [/] "
-            f"{escape(self.path.name)}{flag}{preview_flag}{notice}"
+            f"{escape(self.path.name)}{flag}{preview_flag}{search_flag}{notice}"
             f"[dim]  {row + 1}:{col + 1}[/]"
         )
 
@@ -378,6 +384,8 @@ class EasyMDApp(App):
             self._exit_translation_view()
         elif name == "refresh":
             self._refresh_translation()
+        elif name in ("noh", "nohlsearch"):
+            self.editor.clear_search()
         elif name in ("q", "q!", "qa", "qa!"):
             if name.endswith("!") or not self.modified:
                 self.exit()
