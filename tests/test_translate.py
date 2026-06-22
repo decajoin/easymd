@@ -233,3 +233,68 @@ def test_cache_disabled_when_dir_empty(monkeypatch):
     monkeypatch.setenv("EASYMD_CACHE_DIR", "")
     tr = Translator(_cfg())
     assert tr._cache_dir is None
+
+
+# --- review fixes: failures not cached, key includes lang/model -------------
+
+async def test_failed_chunk_is_not_cached(monkeypatch, tmp_path):
+    tr = Translator(_cfg(), cache_dir=tmp_path)
+    calls = []
+
+    async def failing_post(system_prompt, user_text, on_delta=None):
+        calls.append(user_text)
+        raise translate._CallFailed(f"> [翻译失败] boom\n\n{user_text}")
+
+    monkeypatch.setattr(tr, "_post", failing_post)
+    out = await tr.translate_document("# A\n\nbody\n")
+    assert "[翻译失败]" in out  # failure still shown
+    assert len(calls) == 1
+    # Not cached: a retry hits the API again, and nothing is on disk.
+    await tr.translate_document("# A\n\nbody\n")
+    assert len(calls) == 2
+    assert list(tmp_path.glob("*.md")) == []
+
+
+async def test_failed_summary_is_not_cached(monkeypatch, tmp_path):
+    tr = Translator(_cfg(), cache_dir=tmp_path)
+    calls = []
+
+    async def failing_post(system_prompt, user_text, on_delta=None):
+        calls.append(1)
+        raise translate._CallFailed("> [翻译失败] boom")
+
+    monkeypatch.setattr(tr, "_post", failing_post)
+    await tr.summarize_document("# Doc\n")
+    await tr.summarize_document("# Doc\n")
+    assert len(calls) == 2  # second call not served from a poisoned cache
+
+
+async def test_cache_key_includes_lang_and_model(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_post(system_prompt, user_text, on_delta=None):
+        calls.append(user_text)
+        return "T"
+
+    def translator(model, lang):
+        cfg = Config(
+            api_key="k", base_url="x", model=model, target_lang=lang
+        )
+        tr = Translator(cfg, cache_dir=tmp_path)
+        monkeypatch.setattr(tr, "_post", fake_post)
+        return tr
+
+    doc = "# A\n\nbody\n"
+    await translator("deepseek-v4-flash", "中文").translate_document(doc)
+    n = len(calls)
+    # Same content, different language -> must miss the cache.
+    await translator("deepseek-v4-flash", "English").translate_document(doc)
+    assert len(calls) > n
+    n = len(calls)
+    # Different model -> also a miss.
+    await translator("deepseek-v4-pro", "中文").translate_document(doc)
+    assert len(calls) > n
+    n = len(calls)
+    # Same model + language + content -> cache hit, no new call.
+    await translator("deepseek-v4-flash", "中文").translate_document(doc)
+    assert len(calls) == n

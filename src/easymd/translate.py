@@ -50,6 +50,14 @@ class TranslateError(RuntimeError):
     """Raised when translation cannot proceed (missing extra, key, etc.)."""
 
 
+class _CallFailed(Exception):
+    """A single API call failed; carries the text to show without caching."""
+
+    def __init__(self, fallback: str) -> None:
+        super().__init__(fallback)
+        self.fallback = fallback
+
+
 def split_chunks(markdown: str) -> list[str]:
     """Split Markdown into translatable chunks at top-level heading boundaries.
 
@@ -80,10 +88,6 @@ def split_chunks(markdown: str) -> list[str]:
     return chunks
 
 
-def _chunk_key(chunk: str) -> str:
-    return hashlib.sha256(chunk.encode("utf-8")).hexdigest()
-
-
 class Translator:
     """Translate Markdown via DeepSeek, caching chunks by content hash."""
 
@@ -91,6 +95,12 @@ class Translator:
         self.config = config
         self._cache: dict[str, str] = {}
         self._cache_dir = _default_cache_dir() if cache_dir is ... else cache_dir
+
+    def _key(self, text: str) -> str:
+        # The cache key folds in model and target language so switching either
+        # (e.g. --lang English, --pro) does not return a stale result.
+        base = f"{self.config.model}\x00{self.config.target_lang}\x00{text}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     # --- two-level cache (memory + optional disk) ---------------------------
 
@@ -187,12 +197,17 @@ class Translator:
             raise TranslateError(EXTRAS_HINT)
         if not self.config.has_key:
             raise TranslateError(NO_KEY_HINT)
-        key = "sum:" + _chunk_key(text)
+        key = "sum:" + self._key(text)
         cached = self._cache_get(key)
         if cached is None:
-            cached = await self._post(
-                self._summary_system_prompt(), text, on_delta=on_delta
-            )
+            try:
+                cached = await self._post(
+                    self._summary_system_prompt(), text, on_delta=on_delta
+                )
+            except _CallFailed as exc:
+                if on_chunk is not None:
+                    on_chunk(exc.fallback, 1, 1)
+                return exc.fallback  # show the failure, do not cache it
             self._cache_set(key, cached)
         if on_chunk is not None:
             on_chunk(cached, 1, 1)
@@ -204,7 +219,7 @@ class Translator:
         done: list[str] | None = None,
         on_delta: DeltaCallback | None = None,
     ) -> str:
-        key = _chunk_key(chunk)
+        key = self._key(chunk)
         cached = self._cache_get(key)
         if cached is not None:
             return cached
@@ -215,14 +230,20 @@ class Translator:
             def delta_cb(partial: str) -> None:
                 on_delta("\n\n".join([*prefix, partial]))
 
-        translated = await self._post(
-            self._translate_system_prompt(), chunk, on_delta=delta_cb
-        )
+        try:
+            translated = await self._post(
+                self._translate_system_prompt(), chunk, on_delta=delta_cb
+            )
+        except _CallFailed as exc:
+            return exc.fallback  # show the failure, do not cache it
         self._cache_set(key, translated)
         return translated
 
     async def _call_deepseek(self, chunk: str) -> str:
-        return await self._post(self._translate_system_prompt(), chunk)
+        try:
+            return await self._post(self._translate_system_prompt(), chunk)
+        except _CallFailed as exc:
+            return exc.fallback
 
     async def _post(
         self,
@@ -263,8 +284,8 @@ class Translator:
                 except (KeyError, IndexError, ValueError) as exc:
                     last_error = f"bad response: {exc}"
                     break
-        # A single failed call must not abort the whole document.
-        return f"> [翻译失败] {last_error}\n\n{user_text}"
+        # Signal failure so the caller can show it without caching it.
+        raise _CallFailed(f"> [翻译失败] {last_error}\n\n{user_text}")
 
     async def _post_stream(
         self, system_prompt: str, user_text: str, on_delta: DeltaCallback
@@ -291,7 +312,10 @@ class Translator:
                 ) as resp:
                     if resp.status_code != 200:
                         body = (await resp.aread()).decode("utf-8", "replace")
-                        return f"> [翻译失败] HTTP {resp.status_code}: {body[:200]}"
+                        raise _CallFailed(
+                            f"> [翻译失败] HTTP {resp.status_code}: "
+                            f"{body[:200]}\n\n{user_text}"
+                        )
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -307,5 +331,10 @@ class Translator:
                             acc += piece
                             on_delta(acc)
         except httpx.HTTPError as exc:
-            return acc.strip() or f"> [翻译失败] {exc}\n\n{user_text}"
-        return acc.strip() or f"> [翻译失败] empty response\n\n{user_text}"
+            # Partial output is incomplete; show it but do not cache it.
+            raise _CallFailed(
+                acc.strip() or f"> [翻译失败] {exc}\n\n{user_text}"
+            ) from exc
+        if not acc.strip():
+            raise _CallFailed(f"> [翻译失败] empty response\n\n{user_text}")
+        return acc.strip()
