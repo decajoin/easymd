@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import os
 import re
+import select
+import termios
+import time
+import tty
 
 from rich.style import Style
 from textual import events
@@ -12,6 +18,66 @@ from textual.widgets.text_area import Selection
 
 # A vim "word": a run of word chars, or a run of punctuation.
 WORD_RE = re.compile(r"\w+|[^\w\s]+")
+
+
+def _clipboard_set(text: str) -> bool:
+    """Copy text to the terminal clipboard via OSC 52."""
+    encoded = base64.b64encode(text.encode()).decode()
+    try:
+        with open("/dev/tty", "w") as f:
+            f.write(f"\033]52;c;{encoded}\a")
+            f.flush()
+        return True
+    except OSError:
+        return False
+
+
+def _clipboard_get() -> str:
+    """Read the terminal clipboard via an OSC 52 query.
+
+    Blocks up to 200 ms on /dev/tty in raw mode.  Calling this from inside
+    a key handler is safe: while this function blocks, the asyncio event loop
+    is paused so Textual's terminal reader cannot consume the OSC 52 response
+    before we do.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return ""
+    try:
+        old_attrs = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            os.write(fd, b"\033]52;c;?\a")
+            buf = b""
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    break
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                buf += chunk
+                # OSC response ends with BEL (\a) or ST (\033\\)
+                if b"\a" in buf or b"\x1b\\" in buf:
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    except Exception:
+        return ""
+    finally:
+        os.close(fd)
+    m = re.search(rb"\x1b\]52;[^;]*;([A-Za-z0-9+/=]+)", buf)
+    if m:
+        try:
+            return base64.b64decode(m.group(1)).decode("utf-8", "replace")
+        except Exception:
+            pass
+    return ""
 
 NORMAL = "normal"
 INSERT = "insert"
@@ -34,6 +100,13 @@ class VimTextArea(TextArea):
         def __init__(self, prefix: str) -> None:
             super().__init__()
             self.prefix = prefix
+
+    class Notice(Message):
+        """Transient notice from the editor (e.g. clipboard error) for the status bar."""
+
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
 
     def __init__(self, text: str = "", **kwargs) -> None:
         kwargs.setdefault("tab_behavior", "indent")
@@ -82,6 +155,34 @@ class VimTextArea(TextArea):
     # Key dispatch
 
     async def _on_key(self, event: events.Key) -> None:
+        # System clipboard — works in every mode, including after mouse selection.
+        if event.key == "ctrl+c":
+            event.stop()
+            event.prevent_default()
+            sel = self.selection
+            if not sel.is_empty:
+                start, end = sorted([sel.start, sel.end])
+                # In vim visual mode Textual stores the end as exclusive, but
+                # the highlighted region includes the character under the cursor.
+                # Add +1 to match what the user sees (same as _visual_operate).
+                if self.mode in (VISUAL, VISUAL_LINE):
+                    line_len = len(self.document.get_line(end[0]))
+                    end = (end[0], min(line_len, end[1] + 1))
+                if not _clipboard_set(self.get_text_range(start, end)):
+                    self.post_message(
+                        self.Notice("E: 剪贴板不可用（需要 xclip 或 wl-copy）")
+                    )
+            return
+        if event.key == "ctrl+v":
+            event.stop()
+            event.prevent_default()
+            text = _clipboard_get()
+            if text:
+                self.insert(text, maintain_selection_offset=False)
+            else:
+                self.post_message(self.Notice("E: 剪贴板不可用或为空"))
+            return
+
         if self.mode == INSERT:
             if event.key == "escape":
                 event.stop()

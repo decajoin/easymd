@@ -215,7 +215,7 @@ class EasyMDApp(App):
         status.update(
             f"[bold white on {color}] {label} [/] "
             f"{escape(self.path.name)}{flag}{preview_flag}{search_flag}{notice}"
-            f"[dim]  {row + 1}:{col + 1}  {self._word_count()}W[/]"
+            f"[dim]  {row + 1}:{col + 1}  words: {self._word_count()}[/]"
         )
 
     def _word_count(self) -> int:
