@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import re
 import time
@@ -129,6 +130,16 @@ class EasyMDApp(App):
         self._summary_md = ""
         self._summary_hash: str | None = None  # doc hash when summarized
         self._toc_lines: list[int] = []  # option index -> document line
+        # Cached (source_line, preview_y) anchors for scroll sync. Rebuilt once
+        # per preview update (see _refresh_preview) instead of on every cursor
+        # move — the rebuild walks every block and sorts, which on long docs
+        # made each j/k and scroll O(n) and produced the scroll lag.
+        self._anchor_cache: tuple[object, int, int, list[tuple[int, float]]] | None = None
+        # Invalidated on each text edit; avoids recomputing a full SHA256 of the
+        # entire document on every cursor move while in AI view mode.
+        self._doc_hash_cache: str | None = None
+        # Heading list for translated-mode scroll sync; rebuilt on text change.
+        self._headings_cache: list[tuple[int, str, int]] | None = None
 
     # ------------------------------------------------------------------
     # Layout
@@ -202,6 +213,8 @@ class EasyMDApp(App):
     # Editor events
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self._doc_hash_cache = None
+        self._headings_cache = None
         # In translation view the preview holds the cached translation until the
         # user runs :refresh, so edits only refresh the status (staleness mark).
         if self._preview_mode == "original":
@@ -235,6 +248,8 @@ class EasyMDApp(App):
         else:
             content = self.editor.text
         await self.query_one("#preview", Markdown).update(content)
+        # New blocks are mounted: the anchor cache no longer matches them.
+        self._anchor_cache = None
         # Re-sync once the new blocks have been laid out and measured.
         self.call_after_refresh(self._sync_scroll)
 
@@ -248,6 +263,45 @@ class EasyMDApp(App):
         except Exception:
             return top
 
+    def _anchors(self) -> list[tuple[int, float]] | None:
+        """Cached (source_line, preview_y) anchor pairs for scroll sync.
+
+        Walking every block and sorting is O(n) in the document; doing it on
+        every cursor move is what made long docs feel laggy. We build the list
+        once after each preview update and reuse it until the blocks change.
+        """
+        try:
+            md = self.query_one("#preview", Markdown)
+        except Exception:
+            return None
+        children = md.children
+        cache = self._anchor_cache
+        if cache is not None:
+            cached_md, n_children, first_id, anchors = cache
+            # Same widget, same child count, same first block identity => the
+            # blocks have not been remounted, so the cache is still valid.
+            if (
+                cached_md is md
+                and n_children == len(children)
+                and (n_children == 0 or id(children[0]) == first_id)
+            ):
+                return anchors
+        anchors: list[tuple[int, float]] = []
+        for block in children:
+            source_range = getattr(block, "source_range", None)
+            if source_range is None:
+                continue
+            start, end = source_range
+            y0 = block.virtual_region.y
+            anchors.append((start, float(y0)))
+            anchors.append((end, float(y0 + max(1, block.region.height))))
+        if not anchors:
+            return None
+        anchors.sort()
+        first_id = id(children[0]) if children else 0
+        self._anchor_cache = (md, len(children), first_id, anchors)
+        return anchors
+
     def _preview_y_for_line(self, line: int) -> float | None:
         """Map a source line to a y offset in the preview via block anchors.
 
@@ -255,32 +309,23 @@ class EasyMDApp(App):
         position, so we interpolate piecewise-linearly between block edges —
         this keeps tall blocks (code, tables) aligned, unlike a flat ratio.
         """
-        try:
-            md = self.query_one("#preview", Markdown)
-        except Exception:
-            return None
-        anchors: list[tuple[int, int]] = []
-        for block in md.children:
-            source_range = getattr(block, "source_range", None)
-            if source_range is None:
-                continue
-            start, end = source_range
-            y0 = block.virtual_region.y
-            anchors.append((start, y0))
-            anchors.append((end, y0 + max(1, block.region.height)))
+        anchors = self._anchors()
         if not anchors:
             return None
-        anchors.sort()
-        if line <= anchors[0][0]:
-            return float(anchors[0][1])
-        if line >= anchors[-1][0]:
-            return float(anchors[-1][1])
-        for (l0, y0), (l1, y1) in zip(anchors, anchors[1:]):
-            if l0 <= line <= l1:
-                if l1 == l0:
-                    return float(y0)
-                return y0 + (line - l0) / (l1 - l0) * (y1 - y0)
-        return float(anchors[-1][1])
+        # bisect_left((line,)) lands on the first anchor whose line >= target
+        # (a bare (line,) tuple precedes any (line, y)), matching the old
+        # linear scan's "first segment containing line" even with duplicate
+        # line numbers, but in O(log n).
+        p = bisect.bisect_left(anchors, (line,))
+        if p == 0:
+            return anchors[0][1]
+        if p >= len(anchors):
+            return anchors[-1][1]
+        l0, y0 = anchors[p - 1]
+        l1, y1 = anchors[p]
+        if l1 == l0:
+            return y0
+        return y0 + (line - l0) / (l1 - l0) * (y1 - y0)
 
     def _translated_scroll_y(self) -> float | None:
         """Preview y aligning the editor's current section with the translation.
@@ -288,7 +333,9 @@ class EasyMDApp(App):
         Both documents keep the same heading structure, so we map the heading
         the editor's top line sits under to the same heading in the preview.
         """
-        headings = parse_headings(self.editor.text)
+        if self._headings_cache is None:
+            self._headings_cache = parse_headings(self.editor.text)
+        headings = self._headings_cache
         if not headings:
             return None
         top = self._editor_top_line()
@@ -398,7 +445,11 @@ class EasyMDApp(App):
     }
 
     def _doc_hash(self) -> str:
-        return hashlib.sha256(self.editor.text.encode("utf-8")).hexdigest()
+        if self._doc_hash_cache is None:
+            self._doc_hash_cache = hashlib.sha256(
+                self.editor.text.encode("utf-8")
+            ).hexdigest()
+        return self._doc_hash_cache
 
     def _ai_md(self, mode: str) -> str:
         return self._translated_md if mode == "translated" else self._summary_md
