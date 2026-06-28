@@ -57,6 +57,10 @@ class VimTextArea(TextArea):
         self._change_capture: dict | None = None  # insert change being recorded
         self._insert_text = ""  # text typed during the captured insert
         self._replaying = False  # guard so replay does not re-record
+        # Per-row search highlight entries from the last full scan. Reused as
+        # stale-but-cheap highlights while in INSERT/REPLACE mode to avoid an
+        # O(document_lines) rescan on every keystroke.
+        self._search_highlight_cache: dict[int, list] = {}
 
     # ------------------------------------------------------------------
     # Modes
@@ -64,9 +68,14 @@ class VimTextArea(TextArea):
     def _set_mode(self, mode: str) -> None:
         if mode == self.mode:
             return
+        prev = self.mode
         self.mode = mode
         self._count = ""
         self._pending = ""
+        # After a burst of insert/replace edits, do one exact rescan now that
+        # we are back in normal mode so stale cached highlights are corrected.
+        if prev in (INSERT, REPLACE) and mode not in (INSERT, REPLACE) and self._search:
+            self._refresh_search_highlights()
         self.post_message(self.ModeChanged(mode))
 
     # ------------------------------------------------------------------
@@ -1137,7 +1146,25 @@ class VimTextArea(TextArea):
         # Tree-sitter rebuilds (and clears) _highlights on every edit; re-add
         # the search highlights afterwards so they survive editing.
         super()._build_highlight_map()
-        self._apply_search_highlights()
+        if not getattr(self, "_search", ""):
+            self._search_total = 0
+            self._search_index = 0
+            self._search_highlight_cache = {}
+            return
+        if getattr(self, "mode", NORMAL) in (INSERT, REPLACE):
+            # In insert/replace mode skip the O(n) full-document rescan and
+            # reuse the stale cached entries instead.  They may be slightly
+            # out of date (row numbers can shift), but they are refreshed the
+            # moment the user returns to normal mode (see _set_mode).
+            for row, entries in self._search_highlight_cache.items():
+                self._highlights[row].extend(entries)
+        else:
+            self._apply_search_highlights()
+            self._search_highlight_cache = {
+                row: [e for e in hl if e[2] in ("search", "search_current")]
+                for row, hl in self._highlights.items()
+                if any(e[2] in ("search", "search_current") for e in hl)
+            }
 
     def _refresh_search_highlights(self) -> None:
         self._build_highlight_map()
