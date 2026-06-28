@@ -21,6 +21,13 @@ from .config import Config, load_config
 from .editor import VimTextArea
 from .translate import Translator, TranslateError
 
+# Compiled regexes for word counting (module-level for reuse across calls).
+_CJK_RE = re.compile(
+    r"[⺀-⻿⼀-⿟぀-㆏"
+    r"㐀-䶿一-鿿豈-﫿︰-﹏]"
+)
+_EN_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
 MODE_STYLES = {
     "normal": ("NORMAL", "blue"),
     "insert": ("INSERT", "green"),
@@ -140,6 +147,8 @@ class EasyMDApp(App):
         self._doc_hash_cache: str | None = None
         # Heading list for translated-mode scroll sync; rebuilt on text change.
         self._headings_cache: list[tuple[int, str, int]] | None = None
+        # Word/character count; recomputed once per edit, then cached.
+        self._word_count_cache: int | None = None
 
     # ------------------------------------------------------------------
     # Layout
@@ -206,8 +215,20 @@ class EasyMDApp(App):
         status.update(
             f"[bold white on {color}] {label} [/] "
             f"{escape(self.path.name)}{flag}{preview_flag}{search_flag}{notice}"
-            f"[dim]  {row + 1}:{col + 1}[/]"
+            f"[dim]  {row + 1}:{col + 1}  {self._word_count()}W[/]"
         )
+
+    def _word_count(self) -> int:
+        if self._word_count_cache is None:
+            text = self.editor.text
+            self._word_count_cache = (
+                len(_CJK_RE.findall(text)) + len(_EN_WORD_RE.findall(text))
+            )
+        return self._word_count_cache
+
+    def on_vim_text_area_notice(self, event: VimTextArea.Notice) -> None:
+        self._notice = event.text
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Editor events
@@ -215,6 +236,7 @@ class EasyMDApp(App):
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         self._doc_hash_cache = None
         self._headings_cache = None
+        self._word_count_cache = None
         # In translation view the preview holds the cached translation until the
         # user runs :refresh, so edits only refresh the status (staleness mark).
         if self._preview_mode == "original":
